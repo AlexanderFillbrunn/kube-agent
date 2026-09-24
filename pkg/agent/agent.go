@@ -186,11 +186,6 @@ func (a Agent) closeArc(ctx context.Context, state *agentState) error {
 
 	_, err := a.persistAndFold(ctx, &events.Event{
 		Typ: events.ArcClosedEventType,
-		/* assigned by persistor
-		ID: uuid.New().String(),
-		Seq: state.history.LastSeq + 1,
-		Timestamp: time.Now(),
-		*/
 		CorrelationID: &state.arc.ID,
 		Payload: events.ArcClosedPayload{CausationID: last.ID},
 	}, state)

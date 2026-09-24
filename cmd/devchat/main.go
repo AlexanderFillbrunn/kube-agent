@@ -108,7 +108,7 @@ func run(storePath, modelName, baseURL, systemPrompt, userID string) error {
 	session := &session{
 		id:        storePath,
 		store:     store,
-		persistor: agent.StampSession(agent.GuardCancellation(store, store), storePath),
+		persistor: agent.StampIdentity(agent.GuardCancellation(store, store), storePath),
 		agent:     chat,
 		actor:     users.Actor{UserID: userID, TenantID: "dev"},
 	}

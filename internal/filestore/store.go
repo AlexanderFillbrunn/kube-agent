@@ -109,12 +109,13 @@ func (s *Store) Close() error {
 	return s.file.Close()
 }
 
-// Persist writes one event and returns it as it was stored. The store assigns
-// the identity: an ID, the next sequence number, and the time it was written.
+// Persist writes one event and returns it as it was stored.
 //
-// An event that arrives with an ID keeps it, which is how a caller ties two
-// events together before either is written. Nothing here checks that such an
-// ID is unique.
+// The sequence number is the store's to assign, since it is the position in
+// this log and nothing outside the lock can know it. An ID and a timestamp are
+// filled in only where the caller left them empty, which a caller writing
+// through agent.StampIdentity never does; the fallback is here so that a test
+// writing straight to the store still produces a readable log.
 func (s *Store) Persist(_ context.Context, ev *events.Event) (*events.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

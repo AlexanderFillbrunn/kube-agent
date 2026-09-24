@@ -95,7 +95,7 @@ func TestTurnWritesAWholeArc(t *testing.T) {
 	session := &session{
 		id:        "session",
 		store:     store,
-		persistor: agent.StampSession(store, "session"),
+		persistor: agent.StampIdentity(store, "session"),
 		agent:     chat,
 		actor:     users.Actor{UserID: "dev", TenantID: "dev"},
 	}
@@ -209,7 +209,7 @@ func TestSecondTurnReplaysTheFirst(t *testing.T) {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
-	session := &session{id: "session", store: store, persistor: agent.StampSession(store, "session"), agent: chat}
+	session := &session{id: "session", store: store, persistor: agent.StampIdentity(store, "session"), agent: chat}
 	for _, message := range []string{"what is running?", "and now?"} {
 		if err := session.turn(context.Background(), message); err != nil {
 			t.Fatalf("turn %q: %v", message, err)

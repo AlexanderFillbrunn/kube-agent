@@ -14,8 +14,8 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// fakePersistor stands in for the log, assigning the identity an event gets
-// once it is written.
+// fakePersistor stands in for the log. Like a real store it owns the sequence
+// number and leaves an ID or a time the caller already set.
 type fakePersistor struct {
 	next      int
 	persisted []*events.Event
@@ -23,9 +23,13 @@ type fakePersistor struct {
 
 func (p *fakePersistor) Persist(_ context.Context, ev *events.Event) (*events.Event, error) {
 	stored := *ev
-	stored.ID = fmt.Sprintf("ev-%d", p.next)
 	stored.Seq = p.next
-	stored.Timestamp = time.Unix(int64(p.next), 0)
+	if stored.ID == "" {
+		stored.ID = fmt.Sprintf("ev-%d", p.next)
+	}
+	if stored.Timestamp.IsZero() {
+		stored.Timestamp = time.Unix(int64(p.next), 0)
+	}
 	p.next++
 	p.persisted = append(p.persisted, &stored)
 	return &stored, nil
