@@ -427,6 +427,15 @@ func (a Agent) deriveArcState(arc *history.Arc) (arcState, error) {
 
 	last := arc.Responses[len(arc.Responses)-1]
 	if len(last.ToolCalls) == 0 {
+		// A task that has spoken since the last response has said something
+		// the model has never answered for. It gets a turn, and closing here
+		// would end the arc on a reply written before the task spoke.
+		for _, task := range arc.AsyncTasks {
+			if unreportedTaskNews(task, last.Seq) {
+				return ArcStateLLM, nil
+			}
+		}
+
 		// A task outlives the response that started it, so an arc holding one
 		// is not finished however final that response reads. Closing here
 		// would leave the model unable to account for work it started, and the
@@ -439,4 +448,37 @@ func (a Agent) deriveArcState(arc *history.Arc) (arcState, error) {
 		return ArcStateClose, nil
 	}
 	return ArcStateLLM, nil
+}
+
+// unreportedTaskNews reports whether a task has said something the arc's last
+// response predates: a result nobody has accounted for, or a question it is
+// still waiting on an answer to.
+//
+// Both are decided by sequence number against that response, so a turn the
+// agent has already taken is not taken again and the loop reaches an end.
+//
+// A task's own notifications are not news by this measure. Whether they reach
+// the model at all is a projection setting, and work the model may never be
+// told about must not be what decides that it speaks.
+func unreportedTaskNews(task *history.AsyncTask, respondedSeq int) bool {
+	if task.FinishedSeq != nil && *task.FinishedSeq > respondedSeq {
+		return true
+	}
+	// Only a question still outstanding is worth a turn. One that has been
+	// answered is the task's to get on with, and the answer reaches the model
+	// with whatever the task makes of it.
+	return task.Status == history.AsyncTaskWaiting && lastInputRequestSeq(task) > respondedSeq
+}
+
+// lastInputRequestSeq is where the task last stopped to ask, or -1 for a task
+// that never has. A task can ask more than once, and it is the latest ask that
+// decides whether the agent still owes the user a question.
+func lastInputRequestSeq(task *history.AsyncTask) int {
+	seq := -1
+	for _, event := range task.Events {
+		if event.Type == history.AsyncTaskEventInputRequested {
+			seq = event.Seq
+		}
+	}
+	return seq
 }

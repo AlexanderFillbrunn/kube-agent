@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -526,5 +527,182 @@ func TestAFreshCallIsNotTreatedAsAbandoned(t *testing.T) {
 	}
 	if registry.SafeToRepeat("absent") {
 		t.Error("an unregistered tool reads as safe to repeat")
+	}
+}
+
+// awaitedTaskArc is an arc that started a task, was answered with a reply of
+// its own, and then heard back from the task: the shape a run picking the arc
+// up again finds after a task has settled. The result lands at the sequence
+// number given, so a caller can put it on either side of that reply.
+func awaitedTaskArc(t *testing.T, resultSeq int) *history.History {
+	t.Helper()
+	arc := testArcID
+	actor := users.Actor{UserID: "alice", TenantID: "acme"}
+	at := time.Unix(0, 0)
+
+	log := []events.Event{
+		{ID: arc, Seq: 0, Timestamp: at, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
+			Payload: events.UserMessagePayload{Content: "audit the cluster", Actor: actor}},
+		{ID: "msg-1", Seq: 1, Timestamp: at, Typ: events.AssistantMessageEventType, CorrelationID: &arc,
+			Payload: events.AssistantMessagePayload{ModelID: "gpt-5", Content: "starting the audit"}},
+		{ID: "a-1", Seq: 2, Timestamp: at, Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc,
+			Payload: events.AsyncTaskInvokePayload{TaskName: "auditor"}},
+		{ID: "ar-1", Seq: resultSeq, Timestamp: at, Typ: events.AsyncTaskResultEventType, CorrelationID: &arc,
+			Payload: events.AsyncTaskResultPayload{CausationID: "a-1", Result: "3 findings"}},
+		{ID: "msg-2", Seq: 4, Timestamp: at, Typ: events.AssistantMessageEventType, CorrelationID: &arc,
+			Payload: events.AssistantMessagePayload{ModelID: "gpt-5", Content: "the audit is running"}},
+	}
+	slices.SortFunc(log, func(a, b events.Event) int { return a.Seq - b.Seq })
+
+	h, err := history.Replay("session", log)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	return h
+}
+
+// A task that finished after the arc's last reply is work the model has never
+// reported on. The arc gets one more turn rather than closing on a reply
+// written while the task was still running.
+func TestALateTaskResultGetsTheModelATurn(t *testing.T) {
+	h := awaitedTaskArc(t, 5)
+	persistor := &fakePersistor{next: 10}
+	agent, err := NewAgent(nil, nil, &scriptedLLM{replies: []*LLMResponse{
+		{ModelID: "gpt-5", Content: "the audit found 3 things"},
+	}})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+
+	if err := agent.Run(context.Background(), persistor, h, testArcID); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	want := "ASSISTANT_MESSAGE, ARC_CLOSED"
+	if got := typesOf(persistor.persisted); got != want {
+		t.Fatalf("wrote %s, want %s", got, want)
+	}
+
+	// The close names the reply that reported the result, not the one written
+	// while the task was still running.
+	closing := persistor.persisted[1].Payload.(events.ArcClosedPayload)
+	if closing.CausationID != persistor.persisted[0].ID {
+		t.Errorf("the close names %s, want the reply that reported the result", closing.CausationID)
+	}
+}
+
+// A result the last reply already accounts for is not reported twice. Without
+// this the arc answers itself for as long as the loop keeps reading it.
+func TestATaskResultTheModelHasSeenClosesTheArc(t *testing.T) {
+	h := awaitedTaskArc(t, 3)
+	persistor := &fakePersistor{next: 10}
+	agent, err := NewAgent(nil, nil, &scriptedLLM{})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+
+	if err := agent.Run(context.Background(), persistor, h, testArcID); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if got := typesOf(persistor.persisted); got != "ARC_CLOSED" {
+		t.Fatalf("wrote %s, want ARC_CLOSED", got)
+	}
+}
+
+// waitingTaskArc is an arc whose task stopped to ask for input. The ask lands
+// at the sequence number given, so a caller can put it on either side of the
+// arc's last reply, and answered says whether the input arrived after it.
+func waitingTaskArc(t *testing.T, askSeq int, answered bool) *history.History {
+	t.Helper()
+	arc := testArcID
+	actor := users.Actor{UserID: "alice", TenantID: "acme"}
+	at := time.Unix(0, 0)
+
+	log := []events.Event{
+		{ID: arc, Seq: 0, Timestamp: at, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
+			Payload: events.UserMessagePayload{Content: "audit the cluster", Actor: actor}},
+		{ID: "msg-1", Seq: 1, Timestamp: at, Typ: events.AssistantMessageEventType, CorrelationID: &arc,
+			Payload: events.AssistantMessagePayload{ModelID: "gpt-5", Content: "starting the audit"}},
+		{ID: "a-1", Seq: 2, Timestamp: at, Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc,
+			Payload: events.AsyncTaskInvokePayload{TaskName: "auditor"}},
+		{ID: "aq-1", Seq: askSeq, Timestamp: at, Typ: events.AsyncTaskInputRequestedEventType, CorrelationID: &arc,
+			Payload: events.AsyncTaskInputRequestedPayload{CausationID: "a-1", Message: "which namespace?"}},
+		{ID: "msg-2", Seq: 4, Timestamp: at, Typ: events.AssistantMessageEventType, CorrelationID: &arc,
+			Payload: events.AssistantMessagePayload{ModelID: "gpt-5", Content: "the audit is running"}},
+	}
+	if answered {
+		log = append(log, events.Event{ID: "ap-1", Seq: 6, Timestamp: at, Typ: events.AsyncTaskInputProvidedEventType, CorrelationID: &arc,
+			Payload: events.AsyncTaskInputProvidedPayload{CausationID: "a-1", Message: "kube-system"}})
+	}
+	slices.SortFunc(log, func(a, b events.Event) int { return a.Seq - b.Seq })
+
+	h, err := history.Replay("session", log)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	return h
+}
+
+// A task waiting on input nobody has been asked for yet gets the model a turn,
+// which is the only way the question reaches the person who can answer it. The
+// arc stays open, because the task is still there waiting.
+func TestATaskWaitingOnInputGetsTheModelATurn(t *testing.T) {
+	h := waitingTaskArc(t, 5, false)
+	persistor := &fakePersistor{next: 10}
+	agent, err := NewAgent(nil, nil, &scriptedLLM{replies: []*LLMResponse{
+		{ModelID: "gpt-5", Content: "which namespace should I audit?"},
+	}})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+
+	if err := agent.Run(context.Background(), persistor, h, testArcID); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if got := typesOf(persistor.persisted); got != "ASSISTANT_MESSAGE" {
+		t.Fatalf("wrote %s, want ASSISTANT_MESSAGE alone", got)
+	}
+	if status := h.Arcs[0].Status(); status != history.ArcStatusPending {
+		t.Errorf("the arc is %s, want it left open for the task still waiting", status)
+	}
+}
+
+// The question the agent has already put to the user is not put again. Without
+// this the arc asks for as long as the task waits to be answered.
+func TestAnAskAlreadyPutToTheUserIsNotRepeated(t *testing.T) {
+	h := waitingTaskArc(t, 3, false)
+	persistor := &fakePersistor{next: 10}
+	agent, err := NewAgent(nil, nil, &scriptedLLM{})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+
+	if err := agent.Run(context.Background(), persistor, h, testArcID); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if got := typesOf(persistor.persisted); got != "" {
+		t.Fatalf("wrote %s, want nothing", got)
+	}
+}
+
+// An ask the task already has its answer to is the task's business. The agent
+// has nothing to say about it and waits for what the task makes of it.
+func TestAnAnsweredAskGetsNoTurn(t *testing.T) {
+	h := waitingTaskArc(t, 5, true)
+	persistor := &fakePersistor{next: 10}
+	agent, err := NewAgent(nil, nil, &scriptedLLM{})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+
+	if err := agent.Run(context.Background(), persistor, h, testArcID); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if got := typesOf(persistor.persisted); got != "" {
+		t.Fatalf("wrote %s, want nothing", got)
 	}
 }
