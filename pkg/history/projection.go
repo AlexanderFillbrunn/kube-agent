@@ -467,16 +467,20 @@ func planArc(arc *Arc, modes Modes, isTarget bool) arcPlan {
 func (p *projector) keepArc(arc *Arc) {
 	p.emit(arc.Seq, 0, ModelTextMessage{MessageRole: ModelRoleUser, Content: arc.Content})
 
+	// An arc that was cancelled or died is not coming back, which changes what
+	// an unanswered call under it means: not "no result yet" but "no result,
+	// and none is coming".
+	stoppedSeq, stopped := arcEnd(arc)
 	for _, message := range arc.Responses {
-		p.projectResponse(message)
+		p.projectResponse(message, stopped)
 	}
 	p.projectErrors(arc)
-	p.projectAsyncTasks(arc)
+	p.projectAsyncTasks(arc, stoppedSeq, stopped)
 }
 
 // projectResponse emits one assistant message with its calls, their results
 // and any notes its calls produced.
-func (p *projector) projectResponse(message *AssistantMessage) {
+func (p *projector) projectResponse(message *AssistantMessage, arcStopped bool) {
 	assistant := ModelAssistantMessage{Content: message.Content}
 	var results []ModelMessage
 	var notes []ModelMessage
@@ -490,7 +494,7 @@ func (p *projector) projectResponse(message *AssistantMessage) {
 				results = append(results, ModelToolMessage{
 					ToolCallID: call.ID,
 					Outcome:    ModelToolOutcomePending,
-					Content:    pendingStandIn(call),
+					Content:    pendingStandIn(call, arcStopped),
 					IsError:    false,
 				})
 			case TreatmentNote:
@@ -540,12 +544,24 @@ func (p *projector) projectResponse(message *AssistantMessage) {
 	}
 }
 
-// pendingStandIn says why a call has no result yet. A call nobody has answered
-// and a call nobody has approved are both unanswered, and the model can act on
-// the difference: one waits on a machine, the other on a person.
-func pendingStandIn(call *ToolCall) string {
+// pendingStandIn says why a call has no result. The reasons are not
+// interchangeable and the model acts differently on each: one waits on a
+// machine, one waits on a person, one never ran and never will, and one was
+// handed to its tool and may have taken effect before everything stopped.
+//
+// arcStopped says the arc is over, so nothing further is coming.
+func pendingStandIn(call *ToolCall, arcStopped bool) string {
 	if interrupt := call.Interrupt; interrupt != nil && interrupt.ResolvedSeq == nil {
 		return "[this call is waiting for a human to approve it]"
+	}
+	if arcStopped {
+		if call.DispatchedSeq != nil {
+			// The one thing the log cannot say. Claiming either that it ran or
+			// that it did not would be inventing the answer, and a model told
+			// it did not run is a model that runs it again.
+			return "[this call was handed to its tool and then stopped before it reported. Whether it took effect is not known.]"
+		}
+		return "[this call was never made: the request it belonged to ended first]"
 	}
 	return "[this call has not returned yet]"
 }
@@ -612,7 +628,21 @@ func askNote(interrupt *Interrupt) string {
 
 // projectAsyncTasks emits the two notes every task gets, plus whatever its
 // transcript is allowed to say.
-func (p *projector) projectAsyncTasks(arc *Arc) {
+// arcEnd reports where an arc stopped and whether it stopped at all. An arc
+// that closed normally did not stop: it finished.
+func arcEnd(arc *Arc) (int, bool) {
+	switch arc.Status() {
+	case ArcStatusCancelled:
+		return arc.Cancel.Seq, true
+	case ArcStatusError:
+		if fatal := fatalError(arc); fatal != nil {
+			return fatal.Seq, true
+		}
+	}
+	return 0, false
+}
+
+func (p *projector) projectAsyncTasks(arc *Arc, stoppedSeq int, arcStopped bool) {
 	for _, task := range arc.AsyncTasks {
 		// Fixed rule: a task is always two notes, one at invocation and one at
 		// completion. Without the first the model cannot account for work it
@@ -638,6 +668,17 @@ func (p *projector) projectAsyncTasks(arc *Arc) {
 		}
 
 		if task.FinishedSeq == nil {
+			// A task always gets its second note. An arc that is over is not
+			// going to produce one from a result, so the note says the one
+			// thing the log knows: the task was running and nobody reported
+			// what became of it.
+			if arcStopped {
+				// The note belongs where the arc ended, which is after
+				// everything the task managed to report.
+				p.emitNote(stoppedSeq, 1,
+					"[task %s was still running when this request was stopped. Whether it finished is not known.]",
+					task.TaskName)
+			}
 			continue
 		}
 		switch task.Status {
@@ -730,8 +771,11 @@ func toolResult(call *ToolCall) ModelToolMessage {
 		message.Outcome = ModelToolOutcomeRefused
 		message.Content = refusalText("a human refused this call", message.Content)
 	case ToolCallStatusCancelled:
+		// A cancel only settles a call its tool never saw, so this one
+		// provably never ran. A call that was already dispatched is still
+		// pending and is reported by pendingStandIn instead.
 		message.Outcome = ModelToolOutcomeCancelled
-		message.Content = refusalText("cancelled before this call completed", message.Content)
+		message.Content = refusalText("this call was cancelled before it ran", message.Content)
 	}
 	message.IsError = message.Outcome != ModelToolOutcomeSuccess
 	return message

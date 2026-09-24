@@ -1137,7 +1137,9 @@ func TestCancelThatStoppedARunningTaskIsDisclosed(t *testing.T) {
 		"n{}",
 		"n{}",
 		"u(never mind)")
-	wantNoteContaining(t, transcript, "was cancelled before it finished")
+	// The cancel ended the waiting, not the task. What became of the task is
+	// not something the cancel knows, and the note does not pretend it does.
+	wantNoteContaining(t, transcript, "still running when this request was stopped")
 	wantNoteContaining(t, transcript, "a human stopped this request")
 
 	if cancel := log.history(t).Arcs[0].Cancel; !cancel.TerminatedWork {
@@ -1499,4 +1501,185 @@ func TestANegativeQuoteLimitIsRejected(t *testing.T) {
 	if err := modes.Validate(); err == nil {
 		t.Error("a negative quote limit was accepted")
 	}
+}
+
+// cancelledCallLog is one arc whose two calls were stopped by a cancel: one
+// had reached its tool, the other had not.
+func cancelledCallLog() *logger {
+	reason := "the user stopped it"
+	log := newLogger()
+	log.user("u1", "restart the ingress controller")
+	log.assistant("u1", "r1.1", "restarting it")
+	log.toolCall("u1", "r1.1", "t1.1.1", "restart_deployment", map[string]any{"name": "ingress-nginx"})
+	log.toolCall("u1", "r1.1", "t1.1.2", "list_pods", nil)
+	log.toolDispatched("u1", "t1.1.1")
+	log.cancel("u1", "c1", &reason)
+	return log
+}
+
+// A cancel settles a call its tool never saw. A call already handed to its
+// tool is not the cancel's to settle, because whether it took effect is not
+// something the cancel knows.
+func TestCancelSettlesOnlyTheCallsThatNeverRan(t *testing.T) {
+	arc := cancelledCallLog().history(t).Arcs[0]
+	calls := arc.Responses[0].ToolCalls
+
+	dispatched, never := calls[0], calls[1]
+	if dispatched.Status != ToolCallStatusPending || dispatched.Phase() != ToolCallPhaseDispatched {
+		t.Errorf("the dispatched call is %s in phase %s, want it pending and dispatched",
+			dispatched.Status, dispatched.Phase())
+	}
+	if never.Status != ToolCallStatusCancelled {
+		t.Errorf("the call that never ran is %s, want CANCELLED", never.Status)
+	}
+
+	// Why the arc was cancelled belongs to the cancel. A call the tool never
+	// saw returned nothing, and saying otherwise puts words in its mouth.
+	if never.Result != nil {
+		t.Errorf("the cancelled call carries a result: %#v", never.Result)
+	}
+}
+
+// The result of a stopped call settles it the ordinary way, because the cancel
+// left it open for exactly this.
+func TestAResultAfterACancelSettlesTheCall(t *testing.T) {
+	log := cancelledCallLog()
+	log.toolResult("u1", "t1.1.1", map[string]any{"restarted": "ingress-nginx"}, false)
+
+	call := log.history(t).Arcs[0].Responses[0].ToolCalls[0]
+	if call.Status != ToolCallStatusSuccess {
+		t.Fatalf("the call is %s, want it settled by its own result", call.Status)
+	}
+	if call.FinishedSeq == nil || *call.FinishedSeq <= *call.DispatchedSeq {
+		t.Errorf("the call settled at %v, want it after its dispatch", call.FinishedSeq)
+	}
+}
+
+// What the model is told about a stopped arc. The two calls ended differently
+// and the difference is the one that decides whether it tries again.
+func TestAStoppedArcSaysWhichCallsMayHaveTakenEffect(t *testing.T) {
+	log := cancelledCallLog()
+	log.user("u2", "what happened?")
+
+	noted := project(t, log, "u2", DefaultModes())
+	var reported []string
+	for _, message := range noted.Messages {
+		if result, ok := message.(ModelToolMessage); ok {
+			reported = append(reported, result.Content)
+		}
+	}
+	if len(reported) != 2 {
+		t.Fatalf("the transcript answers %d calls, want both", len(reported))
+	}
+	if !strings.Contains(reported[0], "not known") {
+		t.Errorf("the dispatched call reads %q, want it to say the effect is unknown", reported[0])
+	}
+	if !strings.Contains(reported[1], "cancelled before it ran") {
+		t.Errorf("the call that never ran reads %q", reported[1])
+	}
+}
+
+// A call still pending under a live arc has not returned yet, which is a
+// different thing to one nothing is coming back for.
+func TestALiveArcStillReadsAsWaiting(t *testing.T) {
+	log := newLogger()
+	log.user("u1", "restart the ingress controller")
+	log.assistant("u1", "r1.1", "restarting it")
+	log.toolCall("u1", "r1.1", "t1.1.1", "restart_deployment", nil)
+	log.toolDispatched("u1", "t1.1.1")
+	log.user("u2", "any news?")
+
+	noted := project(t, log, "u2", DefaultModes())
+	for _, message := range noted.Messages {
+		if result, ok := message.(ModelToolMessage); ok {
+			if !strings.Contains(result.Content, "not returned yet") {
+				t.Errorf("a live call reads %q, want it still waiting", result.Content)
+			}
+		}
+	}
+}
+
+// An arc that died of a fatal error is over too, so a call it never made is
+// not one that is still coming.
+func TestADeadArcSaysItsCallsWereNeverMade(t *testing.T) {
+	log := newLogger()
+	log.user("u1", "restart the ingress controller")
+	log.assistant("u1", "r1.1", "restarting it")
+	log.toolCall("u1", "r1.1", "t1.1.1", "restart_deployment", nil)
+	log.failure("u1", "e1", "the model is not available", true)
+	log.user("u2", "what happened?")
+
+	noted := project(t, log, "u2", DefaultModes())
+	for _, message := range noted.Messages {
+		if result, ok := message.(ModelToolMessage); ok {
+			if !strings.Contains(result.Content, "never made") {
+				t.Errorf("a call under a dead arc reads %q", result.Content)
+			}
+		}
+	}
+}
+
+// A task outlives the run that started it, so a cancel cannot say what became
+// of it. It ends the waiting and leaves the task as it found it.
+func TestCancelLeavesARunningTaskUnsettled(t *testing.T) {
+	log := newLogger()
+	log.user("u1", "audit the cluster")
+	log.assistant("u1", "r1.1", "started the audit")
+	log.task("u1", "k1.1", "auditor", nil)
+	log.cancel("u1", "c1.1", nil)
+
+	task := log.history(t).Arcs[0].AsyncTasks[0]
+	if task.Status != AsyncTaskPending {
+		t.Errorf("task is %s, want it left running", task.Status)
+	}
+	if task.FinishedAt != nil || task.FinishedSeq != nil {
+		t.Errorf("task = %#v, want it unfinished", task)
+	}
+}
+
+// A result arriving after the cancel settles the task, the same way a tool
+// result settles a call the cancel left open.
+func TestATaskResultAfterACancelStillSettlesIt(t *testing.T) {
+	log := newLogger()
+	log.user("u1", "audit the cluster")
+	log.assistant("u1", "r1.1", "started the audit")
+	log.task("u1", "k1.1", "auditor", nil)
+	log.cancel("u1", "c1.1", nil)
+	log.taskResult("u1", "k1.1", "14 findings", false)
+	log.user("u2", "anything?")
+
+	task := log.history(t).Arcs[0].AsyncTasks[0]
+	if task.Status != AsyncTaskSuccess || task.Result != "14 findings" {
+		t.Fatalf("task = %#v, want it settled by its own result", task)
+	}
+
+	// And the model is told what it found, rather than that it was stopped.
+	noted := project(t, log, "u2", DefaultModes())
+	wantNoteContaining(t, noted, "task auditor finished: 14 findings")
+	for _, text := range noteTexts(noted) {
+		if strings.Contains(text, "not known") {
+			t.Errorf("note = %q, want no uncertainty about a task that reported", text)
+		}
+	}
+}
+
+// Fixed rule: a task is always two notes. An arc that stopped will never
+// produce a completion event, so the second note has to come from the stop.
+func TestAStoppedArcStillGivesATaskItsSecondNote(t *testing.T) {
+	log := newLogger()
+	log.user("u1", "audit the cluster")
+	log.assistant("u1", "r1.1", "started the audit")
+	log.task("u1", "k1.1", "auditor", nil)
+	log.failure("u1", "e1", "the worker died", true)
+	log.user("u2", "what happened?")
+
+	noted := project(t, log, "u2", DefaultModes())
+	notes := noteTexts(noted)
+	if len(notes) < 2 {
+		t.Fatalf("notes = %q, want the task's start and its stop", notes)
+	}
+	if !strings.Contains(notes[0], "task auditor started") {
+		t.Errorf("first note = %q, want the task starting", notes[0])
+	}
+	wantNoteContaining(t, noted, "still running when this request was stopped")
 }

@@ -27,7 +27,12 @@ const (
 	// ToolCallStatusRefused is a call a human refused when asked to approve
 	// it. A policy would have blocked it without asking.
 	ToolCallStatusRefused ToolCallStatus = "REFUSED"
-	// ToolCallStatusCancelled is a call still pending when its arc was cancelled.
+	// ToolCallStatusCancelled is a call that was still pending, and had never
+	// been dispatched, when its arc was cancelled. It provably never ran.
+	//
+	// A cancel does not settle a call that was already handed to its tool.
+	// That call may still report, and until it does the log cannot say what
+	// became of it, so it stays PENDING in the DISPATCHED phase.
 	ToolCallStatusCancelled ToolCallStatus = "CANCELLED"
 )
 
@@ -150,8 +155,12 @@ const (
 	// AsyncTaskWaiting is a task that has stopped to ask for input and resumes
 	// once the input arrives.
 	AsyncTaskWaiting AsyncTaskStatus = "WAITING"
-	// AsyncTaskCancelled is a task that was still running or waiting when its
-	// arc was cancelled.
+	// AsyncTaskCancelled is a task a runner reported it had stopped.
+	//
+	// Cancelling an arc does not set it. A task that has been invoked has
+	// started, and it outlives the run that started it, so the cancel knows
+	// neither whether it stopped nor what it did first. Cancelling stops the
+	// waiting; what became of the task is the runner's to report.
 	AsyncTaskCancelled AsyncTaskStatus = "CANCELLED"
 )
 
@@ -933,16 +942,27 @@ func (h *History) applyCancel(ev *events.Event, state *FoldState) error {
 			if call.Status != ToolCallStatusPending {
 				continue
 			}
-			call.Status = ToolCallStatusCancelled
-			call.FinishedAt = &ev.Timestamp
-			call.FinishedSeq = &ev.Seq
-			call.Result = pl.Reason
 			if call.Interrupt != nil && call.Interrupt.Status == InterruptPending {
 				// Nobody will answer a decision about a call that is no
 				// longer going to run.
 				call.Interrupt.Status = InterruptCancelled
 				call.Interrupt.ResolvedSeq = &ev.Seq
 			}
+
+			// A call already handed to its tool is not the cancel's to
+			// settle. It may still report, and whether it took effect is not
+			// something the cancel knows; saying CANCELLED here would put a
+			// definite outcome on the log in place of an open question. The
+			// call keeps its phase, and a result that arrives later settles it
+			// the ordinary way.
+			if call.DispatchedSeq != nil {
+				stoppedSomething = true
+				continue
+			}
+
+			call.Status = ToolCallStatusCancelled
+			call.FinishedAt = &ev.Timestamp
+			call.FinishedSeq = &ev.Seq
 			stoppedSomething = true
 		}
 	}
@@ -951,9 +971,10 @@ func (h *History) applyCancel(ev *events.Event, state *FoldState) error {
 		if task.Status != AsyncTaskPending && task.Status != AsyncTaskWaiting {
 			continue
 		}
-		task.Status = AsyncTaskCancelled
-		task.FinishedAt = &ev.Timestamp
-		task.FinishedSeq = &ev.Seq
+		// A task that was invoked has started, and it runs somewhere the
+		// cancel cannot reach. Marking it cancelled would record an outcome
+		// nobody observed. The cancel ends the waiting, which is a fact about
+		// this arc; what became of the task is reported by whoever runs it.
 		stoppedSomething = true
 	}
 

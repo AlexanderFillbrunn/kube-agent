@@ -12,6 +12,12 @@ import (
 // The tools here answer from canned data and touch no cluster. They exist to
 // give the agent loop something to call, and every one of them is a lie a real
 // tool would have to go and find out.
+//
+// They also stand as the worked example of the contract a tool call carries. A
+// call is synchronous, so a handler that returns has said what happened; work
+// that cannot be accounted for by the time it returns belongs in an async task
+// instead. A handler that gives up part way says so in its result, because a
+// returned error is recorded as a definite failure — see restartDeployment.
 
 // registerFakeTools fills a registry with the canned tools the harness offers.
 func registerFakeTools(registry *agent.ToolRegistry) error {
@@ -89,7 +95,7 @@ func listPods(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult,
 	return structured(map[string]any{"pods": matched})
 }
 
-func restartDeployment(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func restartDeployment(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	var args struct {
 		Name      string `json:"name"`
 		Namespace string `json:"namespace"`
@@ -100,6 +106,16 @@ func restartDeployment(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallTo
 	if args.Name == "" || args.Namespace == "" {
 		return toolError("both name and namespace are required"), nil
 	}
+
+	// What a mutating tool owes the log when it is interrupted. Returning the
+	// context error here would be recorded as a definite failure, and a model
+	// told the restart failed is a model that restarts it again. A real tool
+	// would say this whenever it had already issued the change.
+	if err := ctx.Err(); err != nil {
+		return toolError(fmt.Sprintf(
+			"stopped before this call reported (%v). Whether the restart took effect is not known.", err)), nil
+	}
+
 	return structured(map[string]any{
 		"restarted": fmt.Sprintf("%s/%s", args.Namespace, args.Name),
 		"note":      "nothing was restarted: this harness has no cluster",

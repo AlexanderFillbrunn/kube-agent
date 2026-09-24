@@ -77,6 +77,19 @@ type ToolOutcome struct {
 // tool reporting its own failure returns an outcome with IsError set, which is
 // the distinction MCP draws and the one the model needs: the second is
 // something it can correct, the first is not its doing.
+//
+// Either way the handler returned, and a handler that returns has said what
+// happened: a tool call is synchronous, so there is no outcome it can still be
+// waiting on. Work that cannot be accounted for by the time it returns belongs
+// in an async task instead. A tool that may have changed something before
+// giving up says so in its result rather than returning an error, because an
+// error is recorded as a definite failure.
+//
+// A panic is not recovered here on purpose. It is the one way a handler does
+// not return, and turning it into a failed result would claim knowledge of
+// something that stopped halfway. Left alone it takes the worker with it and
+// the call stays dispatched with no result, which is what the log says about
+// work nobody can account for.
 func (r *ToolRegistry) Invoke(ctx context.Context, name string, args any) (ToolOutcome, error) {
 	registered, ok := r.tools[name]
 	if !ok {

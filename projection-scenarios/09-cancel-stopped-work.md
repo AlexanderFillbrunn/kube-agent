@@ -19,7 +19,7 @@ Messages
        [t(T1.1.1)]          kubectl_delete{kind: job, namespace: batch,
                                             selector: status=Failed}
 
-    3  r(T1.1.1:cancel)     "[cancelled before this call completed]"
+    3  r(T1.1.1:cancel)     "[this call was cancelled before it ran]"
 
     4  n{stopped:U1}        "[a human stopped this request while it was
                               running. The approach above did not
@@ -42,6 +42,11 @@ Notes
 - `Cancel.Reason` was empty, so message 4 states that a human stopped this and
   not why. Quote `Reason` where it is present.
 
-- Message 3 is derived. The fold records the call as CANCELLED with the
-  cancel's reason as its result. Compare message 3 in
-  [04-pending-call.md](04-pending-call.md), which is synthesized.
+- Message 3 is derived. T1.1.1 was never dispatched, so the cancel settles it
+  and the outcome is definite: nothing ran. Compare message 3 in
+  [04-pending-call.md](04-pending-call.md), which is synthesized, and
+  [15-cancel-dispatched-call.md](15-cancel-dispatched-call.md), where the call
+  had reached its tool and the outcome is not known.
+
+- Why the arc was cancelled belongs to the cancel and is message 4. It is not
+  the call's result: a call the tool never saw returned nothing.

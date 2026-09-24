@@ -37,6 +37,10 @@ const (
 	toolRunning toolState = "running"
 	toolDone    toolState = "done"
 	toolFailed  toolState = "failed"
+	// toolUnknown is a call that reached its tool and never reported before
+	// everything stopped. Whether it took effect is not known, and showing it
+	// as still running would claim work nobody is doing.
+	toolUnknown toolState = "unknown"
 )
 
 type block struct {
@@ -77,6 +81,7 @@ func (t *transcript) fromHistory(h *history.History) {
 		if arc.Actor != nil {
 			author = arc.Actor.UserID
 		}
+		stopped := arc.Status() == history.ArcStatusCancelled || arc.Status() == history.ArcStatusError
 		t.blocks = append(t.blocks, &block{kind: blockUser, author: author, text: arc.Content})
 
 		for _, response := range arc.Responses {
@@ -89,7 +94,7 @@ func (t *transcript) fromHistory(h *history.History) {
 					id:     call.ID,
 					tool:   call.ToolName,
 					args:   compact(call.Args),
-					state:  stateOf(call),
+					state:  stateOf(call, stopped),
 					result: compact(call.Result),
 				})
 			}
@@ -189,15 +194,21 @@ func (t *transcript) drop(target *block) {
 	}
 }
 
-func stateOf(call *history.ToolCall) toolState {
+// stateOf reads how a call is doing. arcStopped says the arc is over, so a
+// call with no result is not one still being worked on.
+func stateOf(call *history.ToolCall, arcStopped bool) toolState {
 	switch call.Status {
 	case history.ToolCallStatusSuccess:
 		return toolDone
 	case history.ToolCallStatusPending:
-		if call.Phase() == history.ToolCallPhaseDispatched {
+		switch {
+		case call.Phase() != history.ToolCallPhaseDispatched:
+			return toolQueued
+		case arcStopped:
+			return toolUnknown
+		default:
 			return toolRunning
 		}
-		return toolQueued
 	default:
 		return toolFailed
 	}

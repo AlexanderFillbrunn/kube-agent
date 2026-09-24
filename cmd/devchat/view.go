@@ -62,6 +62,7 @@ var toolMarks = map[toolState]struct {
 	toolRunning: {"◍", "11"},
 	toolDone:    {"●", "10"},
 	toolFailed:  {"●", "9"},
+	toolUnknown: {"◑", "13"},
 }
 
 // renderTranscript draws the conversation to a given width.
@@ -115,6 +116,9 @@ func renderTool(b *block, width int) string {
 	)
 	if b.state == toolQueued || b.state == toolRunning {
 		return head + " " + dimStyle.Render(string(b.state))
+	}
+	if b.state == toolUnknown {
+		return head + "\n  " + dimStyle.Render("? stopped before it reported; effect unknown")
 	}
 
 	arrow := "→"

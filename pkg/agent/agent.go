@@ -114,7 +114,10 @@ func (a Agent) Run(ctx context.Context, sessionID string, h *history.History, ar
 // and an agent writing its own cancel would be claiming an authority it does
 // not have and an actor it does not know.
 func (a Agent) recordFailure(ctx context.Context, cause error, state *agentState) error {
-	if errors.Is(cause, context.Canceled) {
+	// A cancel reaches a run two ways — the context it was given, and a write
+	// the store would not take — and neither is a failure to record. The arc
+	// is already closed by the cancel that stopped it.
+	if errors.Is(cause, context.Canceled) || errors.Is(cause, CancelledError) {
 		return cause
 	}
 
@@ -309,6 +312,13 @@ func (a Agent) toolStep(ctx context.Context, state *agentState) error {
 	}
 
 	for _, call := range pending {
+		// The arc is re-read before each call rather than trusted from the
+		// slice, because a cancel recorded elsewhere reaches this run through
+		// the fold, and a run that has been stopped must not start the next
+		// tool.
+		if state.arc.Status() != history.ArcStatusPending {
+			return nil
+		}
 		if err := a.runToolCall(ctx, call, state); err != nil {
 			return err
 		}
@@ -332,18 +342,17 @@ func (a Agent) runToolCall(ctx context.Context, call *history.ToolCall, state *a
 		return err
 	}
 
+	// A tool call is synchronous, so a handler that returned has said what
+	// happened, whatever it returned and whatever the context is doing by
+	// then. Dropping that because the run was cancelled would leave a call
+	// looking like one nobody ever heard back from, which is the one thing
+	// the log reserves for a tool that never reported at all.
 	outcome, err := a.tools.Invoke(ctx, call.ToolName, call.Args)
 	if err != nil {
-		// A tool that broke is still an outcome, and one the model is told
-		// about so it can do something else. Cancellation is not: the run is
-		// over, and whoever cancelled it settles the arc.
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
 		outcome = ToolOutcome{Result: err.Error(), IsError: true}
 	}
 
-	_, err = a.persistAndFold(ctx, &events.Event{
+	if _, err := a.persistAndFold(ctx, &events.Event{
 		Typ:           events.ToolResultEventType,
 		SessionID:     state.sessionID,
 		CorrelationID: &state.arc.ID,
@@ -352,8 +361,14 @@ func (a Agent) runToolCall(ctx context.Context, call *history.ToolCall, state *a
 			Result:      outcome.Result,
 			IsError:     outcome.IsError,
 		},
-	}, state)
-	return err
+	}, state); err != nil {
+		return err
+	}
+
+	// The call is settled either way; the run is over only if someone stopped
+	// it. Both are true at once when a cancel interrupted the tool, and both
+	// have to be reported.
+	return ctx.Err()
 }
 
 // deriveArcState decides what the agent does next by reading the arc alone, so

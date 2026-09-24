@@ -365,3 +365,37 @@ type brokenPersistor struct {
 func (p *brokenPersistor) Persist(context.Context, *events.Event) (*events.Event, error) {
 	return nil, errors.New("the log is full")
 }
+
+// A tool call is synchronous, so a handler that returned has said what
+// happened — including when the run was cancelled out from under it. Dropping
+// that would leave the call looking like one nobody ever heard back from.
+func TestAHandlerThatReturnsUnderCancellationIsStillRecorded(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	registry := registryWith(t, "restart_deployment", func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		cancel()
+		return nil, errors.New("the API call was interrupted")
+	})
+
+	persistor := &fakePersistor{next: 1}
+	agent, err := NewAgent(nil, registry, persistor, &scriptedLLM{replies: []*LLMResponse{
+		{ModelID: "gpt-5", ToolCalls: []LLMToolCall{{VendorID: "call_abc", ToolName: "restart_deployment"}}},
+	}})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+
+	h := userArcHistory(t)
+	if err := agent.Run(ctx, "session", h, testArcID); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v, want the cancellation", err)
+	}
+
+	want := "ASSISTANT_MESSAGE, TOOL_CALL, TOOL_DISPATCHED, TOOL_RESULT"
+	if got := typesOf(persistor.persisted); got != want {
+		t.Fatalf("wrote %s, want %s", got, want)
+	}
+
+	call := h.Arcs[0].Responses[0].ToolCalls[0]
+	if call.Status != history.ToolCallStatusFailed {
+		t.Errorf("the call is %s, want it settled as failed", call.Status)
+	}
+}

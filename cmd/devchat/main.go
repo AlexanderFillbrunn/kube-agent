@@ -95,7 +95,11 @@ func run(storePath, modelName, baseURL, systemPrompt, userID string) error {
 			}),
 		},
 		registry,
-		store,
+		// The guard turns a cancel recorded in the log into a run that stops,
+		// which is what lets a cancel from anywhere but this process take
+		// effect. Here that is only ever this process, so it earns its keep as
+		// the wiring rather than the feature.
+		agent.GuardCancellation(store, store),
 		llm,
 	)
 	if err != nil {

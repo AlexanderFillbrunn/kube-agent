@@ -144,11 +144,15 @@ func TestHistoryFoldAppliesGuardrailAndCancel(t *testing.T) {
 	if calls[0].Status != ToolCallStatusBlocked || calls[0].Result != "not allowed" {
 		t.Errorf("guardrailed tool = %#v", calls[0])
 	}
-	if calls[1].Status != ToolCallStatusCancelled || calls[1].Result == nil || *calls[1].Result.(*string) != "user stopped" {
+	// The call never reached its tool, so the cancel settles it. Why the arc
+	// was cancelled belongs to the cancel, not to a call the tool never saw.
+	if calls[1].Status != ToolCallStatusCancelled || calls[1].Result != nil {
 		t.Errorf("cancelled tool = %#v", calls[1])
 	}
-	if got.AsyncTasks[0].Status != AsyncTaskCancelled || got.AsyncTasks[0].FinishedAt == nil {
-		t.Errorf("cancelled task = %#v", got.AsyncTasks[0])
+	// The task was invoked, so it started, and it runs where the cancel cannot
+	// reach it. Cancelling ends the waiting, not the task.
+	if got.AsyncTasks[0].Status != AsyncTaskWaiting || got.AsyncTasks[0].FinishedAt != nil {
+		t.Errorf("task after the cancel = %#v, want it left unsettled", got.AsyncTasks[0])
 	}
 	if interrupt := calls[1].Interrupt; interrupt == nil || interrupt.Status != InterruptCancelled {
 		t.Errorf("interrupt = %#v, want it cancelled with the call it held up", calls[1].Interrupt)

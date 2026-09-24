@@ -188,6 +188,24 @@ func (s *Store) GetEventsForArc(_ context.Context, arcID string) ([]*events.Even
 	return selected, nil
 }
 
+// Cancelled returns the cancel recorded against an arc, or nil where there is
+// none. It scans the log, which is what everything here does.
+func (s *Store) Cancelled(_ context.Context, arcID string) (*events.Event, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	all, err := readFile(s.path)
+	if err != nil {
+		return nil, err
+	}
+	for i := range all {
+		if all[i].Typ == events.CancelEventType && correlatesTo(&all[i], arcID) {
+			return &all[i], nil
+		}
+	}
+	return nil, nil
+}
+
 func correlatesTo(ev *events.Event, arcID string) bool {
 	return ev.CorrelationID != nil && *ev.CorrelationID == arcID
 }

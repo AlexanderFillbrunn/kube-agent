@@ -439,6 +439,52 @@ the log usually records that a human stopped this and not why. "The user
 stopped this before it finished" is supported. "The user rejected this
 approach" is not. Quote `Reason` where it is present.
 
+What a cancel settles
+--------------------
+A cancel settles the calls its tools never saw, and only those. A call with no
+dispatch provably never ran, nothing more will arrive for it, and it is
+reported as cancelled.
+
+A call that was already dispatched is not the cancel's to settle. The tool may
+still report, and whether it took effect is not something the cancel knows. It
+stays pending in the DISPATCHED phase, and a result arriving later settles it
+the ordinary way — which is how a call that completed after everything stopped
+still reaches the model as completed.
+
+So a stopped arc answers its calls three ways, and the differences are the ones
+that decide whether the model tries the work again.
+
+    never dispatched    "[this call was cancelled before it ran]"
+                        Definite. Nothing happened.
+
+    dispatched, no      "[this call was handed to its tool and then stopped
+    result yet          before it reported. Whether it took effect is not
+                        known.]"
+
+    dispatched, result  the result. The cancel stopped the run, not the call.
+
+The middle one is the only thing the log cannot say, and it must not be
+resolved by guessing. A model told the call did not run is a model that runs it
+again.
+
+The same three readings apply to an arc that died of a fatal error, which is
+over for the same reason: nothing further is coming.
+
+An async task is governed by the same rule, with no first case: a task that has
+been invoked has started, so a cancel settles none of them. It runs where the
+cancel cannot reach it and outlives the run that began it, so cancelling ends
+the waiting rather than the task. What became of it is the runner's to report,
+and a result arriving after the cancel settles the task the ordinary way.
+
+Fixed rule 4 still holds, so a task the arc stopped on gets its second note
+from the stop rather than from a completion that will never arrive.
+
+    [task auditor was still running when this request was stopped. Whether it
+     finished is not known.]
+
+The note is placed where the arc ended, which is after everything the task
+managed to report.
+
 Errors
 --------------------
 `Error.IsFatal` decides which mode applies. A fatal error closes its arc, so
