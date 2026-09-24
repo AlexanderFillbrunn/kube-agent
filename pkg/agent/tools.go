@@ -60,6 +60,23 @@ func (r *ToolRegistry) All() []*mcp.Tool {
 	return tools
 }
 
+// SafeToRepeat reports whether running a tool twice with the same arguments
+// is as good as running it once.
+//
+// It answers from the tool's own annotations, and an undeclared tool is not
+// safe: both hints default to false, which is the right way round. A tool that
+// forgot to say is treated as one that changes something.
+//
+// This is a declaration, not an observation. It says what the tool's author
+// promised, which is all anyone can know without running it.
+func (r *ToolRegistry) SafeToRepeat(name string) bool {
+	tool, ok := r.tools[name]
+	if !ok || tool.tool.Annotations == nil {
+		return false
+	}
+	return tool.tool.Annotations.ReadOnlyHint || tool.tool.Annotations.IdempotentHint
+}
+
 // ToolOutcome is what a tool produced, in the terms the log records it in.
 type ToolOutcome struct {
 	Result  any
@@ -84,6 +101,10 @@ type ToolOutcome struct {
 // in an async task instead. A tool that may have changed something before
 // giving up says so in its result rather than returning an error, because an
 // error is recorded as a definite failure.
+//
+// Whether a call may be made twice is a separate question, answered by
+// SafeToRepeat from the tool's annotations, and it only arises for a call an
+// earlier run had already dispatched.
 //
 // A panic is not recovered here on purpose. It is the one way a handler does
 // not return, and turning it into a failed result would claim knowledge of

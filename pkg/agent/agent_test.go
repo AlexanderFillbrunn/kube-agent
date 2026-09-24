@@ -419,3 +419,112 @@ func TestAHandlerThatReturnsUnderCancellationIsStillRecorded(t *testing.T) {
 		t.Errorf("the call is %s, want it settled as failed", call.Status)
 	}
 }
+
+// abandonedArc is an arc whose call reached its tool and whose run then
+// stopped without reporting: what a dead worker leaves behind.
+func abandonedArc(t *testing.T) *history.History {
+	t.Helper()
+	arc := testArcID
+	actor := users.Actor{UserID: "alice", TenantID: "acme"}
+	at := time.Unix(0, 0)
+
+	h, err := history.Replay("session", []events.Event{
+		{ID: arc, Seq: 0, Timestamp: at, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
+			Payload: events.UserMessagePayload{Content: "restart the ingress controller", Actor: actor}},
+		{ID: "msg-1", Seq: 1, Timestamp: at, Typ: events.AssistantMessageEventType, CorrelationID: &arc,
+			Payload: events.AssistantMessagePayload{ModelID: "gpt-5", Content: "restarting"}},
+		{ID: "tc-1", Seq: 2, Timestamp: at, Typ: events.ToolCallEventType, CorrelationID: &arc,
+			Payload: events.ToolCallPayload{MessageID: "msg-1", VendorID: "call_abc", ToolName: "restart_deployment"}},
+		{ID: "td-1", Seq: 3, Timestamp: at, Typ: events.ToolDispatchedEventType, CorrelationID: &arc,
+			Payload: events.ToolDispatchedPayload{CausationID: "tc-1"}},
+	})
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	return h
+}
+
+// recoverAbandoned picks the arc up again with a tool carrying the given
+// annotations, and reports whether the tool ran.
+func recoverAbandoned(t *testing.T, annotations *mcp.ToolAnnotations) (*history.ToolCall, bool) {
+	t.Helper()
+	var ran bool
+	registry := NewToolRegistry()
+	err := registry.RegisterTool(
+		&mcp.Tool{Name: "restart_deployment", Annotations: annotations},
+		func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			ran = true
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "restarted"}}}, nil
+		})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	agent, err := NewAgent(nil, registry, &scriptedLLM{replies: []*LLMResponse{{ModelID: "gpt-5", Content: "done"}}})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+
+	h := abandonedArc(t)
+	if err := agent.Run(context.Background(), &fakePersistor{next: 10}, h, testArcID); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	return h.Arcs[0].Responses[0].ToolCalls[0], ran
+}
+
+// A call that may already have restarted a deployment is not restarted again
+// on the strength of nobody having written down what happened.
+func TestAnAbandonedCallIsSettledRatherThanRepeated(t *testing.T) {
+	call, ran := recoverAbandoned(t, nil)
+
+	if ran {
+		t.Error("a tool that never said it was safe to repeat was run twice")
+	}
+	if call.Status != history.ToolCallStatusFailed {
+		t.Errorf("the call is %s, want it settled", call.Status)
+	}
+	if call.Dispatches != 1 {
+		t.Errorf("the call was dispatched %d times, want the one an earlier run wrote", call.Dispatches)
+	}
+
+	// The status says it did not succeed; only the text can say the tool may
+	// have done the work anyway.
+	result, _ := call.Result.(string)
+	if !strings.Contains(result, "not known") {
+		t.Errorf("result = %q, want it to say the effect is unknown", result)
+	}
+}
+
+// A tool whose author says repeating it is harmless gets its second attempt.
+func TestAnIdempotentCallIsRepeated(t *testing.T) {
+	call, ran := recoverAbandoned(t, &mcp.ToolAnnotations{IdempotentHint: true})
+	if !ran {
+		t.Error("an idempotent tool was not tried again")
+	}
+	if call.Status != history.ToolCallStatusSuccess {
+		t.Errorf("the call is %s, want its real result", call.Status)
+	}
+	if call.Dispatches != 2 {
+		t.Errorf("the call was dispatched %d times, want the first and the retry", call.Dispatches)
+	}
+}
+
+func TestAReadOnlyCallIsRepeated(t *testing.T) {
+	if _, ran := recoverAbandoned(t, &mcp.ToolAnnotations{ReadOnlyHint: true}); !ran {
+		t.Error("a read-only tool was not tried again")
+	}
+}
+
+// A call nobody has dispatched is untouched by any of this: it runs.
+func TestAFreshCallIsNotTreatedAsAbandoned(t *testing.T) {
+	registry := NewToolRegistry()
+	if err := registry.RegisterTool(&mcp.Tool{Name: "list_pods"}, nil); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if registry.SafeToRepeat("list_pods") {
+		t.Error("a tool with no annotations reads as safe to repeat")
+	}
+	if registry.SafeToRepeat("absent") {
+		t.Error("an unregistered tool reads as safe to repeat")
+	}
+}

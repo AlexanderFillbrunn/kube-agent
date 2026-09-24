@@ -316,11 +316,48 @@ func (a Agent) toolStep(ctx context.Context, state *agentState) error {
 		if state.arc.Status() != history.ArcStatusPending {
 			return nil
 		}
+
+		// A call another run already handed to its tool may have taken effect,
+		// and running it again would be a second attempt at work that might
+		// have succeeded the first time. Only a tool that says repeating it is
+		// harmless gets a second attempt; the rest are settled as abandoned.
+		if call.Phase() == history.ToolCallPhaseDispatched && !a.tools.SafeToRepeat(call.ToolName) {
+			if err := a.abandonToolCall(ctx, call, state); err != nil {
+				return err
+			}
+			continue
+		}
+
 		if err := a.runToolCall(ctx, call, state); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// abandonToolCall settles a call that an earlier run dispatched and never
+// reported on, without running it again.
+//
+// It is recorded as a failure because it did not succeed, and the text says
+// the part the status cannot: that the tool may have done the work anyway.
+// Leaving the call pending instead would be honest and unworkable — the loop
+// reads the arc to decide what to do next, so a call nobody settles is one the
+// agent asks itself about forever.
+func (a Agent) abandonToolCall(ctx context.Context, call *history.ToolCall, state *agentState) error {
+	_, err := a.persistAndFold(ctx, &events.Event{
+		Typ:           events.ToolResultEventType,
+		CorrelationID: &state.arc.ID,
+		Payload: events.ToolResultPayload{
+			CausationID: call.ID,
+			IsError:     true,
+			Result: fmt.Sprintf(
+				"this call was handed to %s by a run that stopped before reporting. "+
+					"Whether it took effect is not known, and it was not tried again "+
+					"because %s is not declared safe to repeat. Check the current state "+
+					"before deciding what to do.", call.ToolName, call.ToolName),
+		},
+	}, state)
+	return err
 }
 
 // runToolCall records that a call was handed to its tool, runs it, and records

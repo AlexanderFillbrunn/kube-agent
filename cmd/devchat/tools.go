@@ -30,6 +30,9 @@ func registerFakeTools(registry *agent.ToolRegistry) error {
 			tool: &mcp.Tool{
 				Name:        "list_pods",
 				Description: "List the pods in a namespace and their phase.",
+				// Reading changes nothing, so a run that recovers this call
+				// after a worker died may simply make it again.
+				Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 				InputSchema: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -65,6 +68,10 @@ func registerFakeTools(registry *agent.ToolRegistry) error {
 			tool: &mcp.Tool{
 				Name:        "restart_deployment",
 				Description: "Roll out a restart of one deployment.",
+				// No hints, which is the honest default: a restart that may
+				// already have happened is not one to repeat on the strength
+				// of nobody having written down what became of it.
+				Annotations: &mcp.ToolAnnotations{},
 				InputSchema: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
