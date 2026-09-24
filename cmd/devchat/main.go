@@ -99,7 +99,6 @@ func run(storePath, modelName, baseURL, systemPrompt, userID string) error {
 		// which is what lets a cancel from anywhere but this process take
 		// effect. Here that is only ever this process, so it earns its keep as
 		// the wiring rather than the feature.
-		agent.GuardCancellation(store, store),
 		llm,
 	)
 	if err != nil {
@@ -107,10 +106,11 @@ func run(storePath, modelName, baseURL, systemPrompt, userID string) error {
 	}
 
 	session := &session{
-		id:    storePath,
-		store: store,
-		agent: chat,
-		actor: users.Actor{UserID: userID, TenantID: "dev"},
+		id:        storePath,
+		store:     store,
+		persistor: agent.StampSession(agent.GuardCancellation(store, store), storePath),
+		agent:     chat,
+		actor:     users.Actor{UserID: userID, TenantID: "dev"},
 	}
 
 	// The conversation already on disk is shown before anything is asked, so

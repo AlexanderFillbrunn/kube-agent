@@ -18,8 +18,12 @@ type session struct {
 	// since a session and its file are the same thing here.
 	id    string
 	store *filestore.Store
-	agent *agent.Agent
-	actor users.Actor
+	// persistor is the store with the session's own writing rules around it:
+	// what it files is filed under this session, and it refuses work on an arc
+	// somebody has cancelled.
+	persistor agent.EventPersistor
+	agent     *agent.Agent
+	actor     users.Actor
 }
 
 // turn opens an arc with what the user said and runs the agent to the end of
@@ -30,13 +34,12 @@ func (s *session) turn(ctx context.Context, message string) error {
 	// under.
 	arcID := filestore.NewID()
 	opening := &events.Event{
-		SessionID:     s.id,
 		Typ:           events.UserMessageEventType,
 		CorrelationID: &arcID,
 		Actor:         s.actor,
 		Payload:       events.UserMessagePayload{Content: message, Actor: s.actor},
 	}
-	if _, err := s.store.Persist(ctx, opening); err != nil {
+	if _, err := s.persistor.Persist(ctx, opening); err != nil {
 		return err
 	}
 
@@ -44,7 +47,7 @@ func (s *session) turn(ctx context.Context, message string) error {
 	if err != nil {
 		return err
 	}
-	return s.agent.Run(ctx, s.id, h, arcID)
+	return s.agent.Run(ctx, s.persistor, h, arcID)
 }
 
 // arcHistory loads and folds the events one arc is run from.

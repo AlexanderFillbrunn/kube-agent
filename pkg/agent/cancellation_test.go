@@ -45,7 +45,8 @@ func runGuarded(t *testing.T, cancels *cancelledArcs) (*history.History, *fakePe
 	})
 
 	persistor := &fakePersistor{next: 1}
-	agent, err := NewAgent(nil, registry, GuardCancellation(persistor, cancels), &scriptedLLM{replies: []*LLMResponse{
+	guarded := GuardCancellation(persistor, cancels)
+	agent, err := NewAgent(nil, registry, &scriptedLLM{replies: []*LLMResponse{
 		{ModelID: "gpt-5", ToolCalls: []LLMToolCall{{VendorID: "call_abc", ToolName: "list_pods"}}},
 		{ModelID: "gpt-5", Content: "two are pending"},
 	}})
@@ -54,7 +55,7 @@ func runGuarded(t *testing.T, cancels *cancelledArcs) (*history.History, *fakePe
 	}
 
 	h := userArcHistory(t)
-	runErr := agent.Run(context.Background(), "session", h, testArcID)
+	runErr := agent.Run(context.Background(), guarded, h, testArcID)
 	if ran && cancels.arcs[testArcID] != nil {
 		t.Error("the tool ran for a cancelled arc")
 	}

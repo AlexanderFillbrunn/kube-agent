@@ -42,17 +42,13 @@ type AgentConfig struct {
 type Agent struct {
 	config *AgentConfig
 	tools *ToolRegistry
-	events EventPersistor
 	llm LLM
 }
 
 // NewAgent builds an agent from the parts it runs on. A nil config or registry
 // is an agent with no system prompt and no tools, which is a usable agent; a
-// missing persistor or model is not, since neither has a sane default.
-func NewAgent(config *AgentConfig, tools *ToolRegistry, persistor EventPersistor, llm LLM) (*Agent, error) {
-	if persistor == nil {
-		return nil, errors.New("an agent needs an event persistor")
-	}
+// missing model is not, since it has no sane default.
+func NewAgent(config *AgentConfig, tools *ToolRegistry, llm LLM) (*Agent, error) {
 	if llm == nil {
 		return nil, errors.New("an agent needs a model")
 	}
@@ -62,18 +58,28 @@ func NewAgent(config *AgentConfig, tools *ToolRegistry, persistor EventPersistor
 	if tools == nil {
 		tools = NewToolRegistry()
 	}
-	return &Agent{config: config, tools: tools, events: persistor, llm: llm}, nil
+	return &Agent{config: config, tools: tools, llm: llm}, nil
 }
 
 type agentState struct {
 	history *history.History
 	arc *history.Arc
 	foldState *history.FoldState
-	sessionID string
+	persistor EventPersistor
 }
 
-// Run invokes the agent to complete an arc, i.e. a user message triggering the agent.
-func (a Agent) Run(ctx context.Context, sessionID string, h *history.History, arcID string) error {
+// Run invokes the agent to complete an arc, i.e. a user message triggering the
+// agent.
+//
+// The log to write to is named per run rather than per agent, because it is
+// the conversation that belongs to a log and not the agent: one agent answers
+// for as many sessions as it is handed, and what a run records lands wherever
+// the caller filed the user message that opened the arc.
+func (a Agent) Run(ctx context.Context, persistor EventPersistor, h *history.History, arcID string) error {
+	if persistor == nil {
+		return errors.New("a run needs an event persistor")
+	}
+
 	var arc *history.Arc
 	for _, a := range slices.Backward(h.Arcs) {
 		if a.ID == arcID {
@@ -91,7 +97,7 @@ func (a Agent) Run(ctx context.Context, sessionID string, h *history.History, ar
 		history: h,
 		arc: arc,
 		foldState: foldState,
-		sessionID: sessionID,
+		persistor: persistor,
 	}
 
 	if err := a.steps(ctx, state); err != nil {
@@ -123,7 +129,6 @@ func (a Agent) recordFailure(ctx context.Context, cause error, state *agentState
 
 	failure := &events.Event{
 		Typ:           events.ErrorEventType,
-		SessionID:     state.sessionID,
 		CorrelationID: &state.arc.ID,
 		Payload:       events.ErrorPayload{Message: cause.Error(), IsFatal: true},
 	}
@@ -181,7 +186,6 @@ func (a Agent) closeArc(ctx context.Context, state *agentState) error {
 
 	_, err := a.persistAndFold(ctx, &events.Event{
 		Typ: events.ArcClosedEventType,
-		SessionID: state.sessionID,
 		/* assigned by persistor
 		ID: uuid.New().String(),
 		Seq: state.history.LastSeq + 1,
@@ -198,7 +202,7 @@ func (a Agent) closeArc(ctx context.Context, state *agentState) error {
 // timestamp, so a caller that has to name this event in a later one reads them
 // from what comes back rather than inventing them.
 func (a Agent) persistAndFold(ctx context.Context, ev *events.Event, state *agentState) (*events.Event, error) {
-	newEv, err := a.events.Persist(ctx, ev)
+	newEv, err := state.persistor.Persist(ctx, ev)
 	if err != nil {
 		return nil, fmt.Errorf("error persisting %s event: %w", ev.Typ, err)
 	}
@@ -238,7 +242,6 @@ func (a Agent) llmStep(ctx context.Context, state *agentState) error {
 func (a Agent) recordResponse(ctx context.Context, response *LLMResponse, state *agentState) error {
 	message, err := a.persistAndFold(ctx, &events.Event{
 		Typ:           events.AssistantMessageEventType,
-		SessionID:     state.sessionID,
 		CorrelationID: &state.arc.ID,
 		Payload: events.AssistantMessagePayload{
 			VendorID:  response.VendorID,
@@ -277,7 +280,6 @@ func (a Agent) recordToolCalls(ctx context.Context, calls []LLMToolCall, message
 	for _, call := range calls {
 		_, err := a.persistAndFold(ctx, &events.Event{
 			Typ:           events.ToolCallEventType,
-			SessionID:     state.sessionID,
 			CorrelationID: &state.arc.ID,
 			Payload: events.ToolCallPayload{
 				MessageID: messageID,
@@ -335,7 +337,6 @@ func (a Agent) toolStep(ctx context.Context, state *agentState) error {
 func (a Agent) runToolCall(ctx context.Context, call *history.ToolCall, state *agentState) error {
 	if _, err := a.persistAndFold(ctx, &events.Event{
 		Typ:           events.ToolDispatchedEventType,
-		SessionID:     state.sessionID,
 		CorrelationID: &state.arc.ID,
 		Payload:       events.ToolDispatchedPayload{CausationID: call.ID},
 	}, state); err != nil {
@@ -354,7 +355,6 @@ func (a Agent) runToolCall(ctx context.Context, call *history.ToolCall, state *a
 
 	if _, err := a.persistAndFold(ctx, &events.Event{
 		Typ:           events.ToolResultEventType,
-		SessionID:     state.sessionID,
 		CorrelationID: &state.arc.ID,
 		Payload: events.ToolResultPayload{
 			CausationID: call.ID,

@@ -86,7 +86,6 @@ func TestTurnWritesAWholeArc(t *testing.T) {
 			}),
 		},
 		registry,
-		store,
 		agent.NewOpenAI("test-key", "gpt-5", agent.WithBaseURL(model.URL)),
 	)
 	if err != nil {
@@ -94,10 +93,11 @@ func TestTurnWritesAWholeArc(t *testing.T) {
 	}
 
 	session := &session{
-		id:    "session",
-		store: store,
-		agent: chat,
-		actor: users.Actor{UserID: "dev", TenantID: "dev"},
+		id:        "session",
+		store:     store,
+		persistor: agent.StampSession(store, "session"),
+		agent:     chat,
+		actor:     users.Actor{UserID: "dev", TenantID: "dev"},
 	}
 	if err := session.turn(context.Background(), "what is pending?"); err != nil {
 		t.Fatalf("turn: %v", err)
@@ -203,13 +203,13 @@ func TestSecondTurnReplaysTheFirst(t *testing.T) {
 	if err := registerFakeTools(registry); err != nil {
 		t.Fatalf("registerFakeTools: %v", err)
 	}
-	chat, err := agent.NewAgent(nil, registry, store,
+	chat, err := agent.NewAgent(nil, registry,
 		agent.NewOpenAI("test-key", "gpt-5", agent.WithBaseURL(recorder.URL)))
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
-	session := &session{id: "session", store: store, agent: chat}
+	session := &session{id: "session", store: store, persistor: agent.StampSession(store, "session"), agent: chat}
 	for _, message := range []string{"what is running?", "and now?"} {
 		if err := session.turn(context.Background(), message); err != nil {
 			t.Fatalf("turn %q: %v", message, err)

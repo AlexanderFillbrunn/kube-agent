@@ -37,7 +37,7 @@ func (p *fakePersistor) Persist(_ context.Context, ev *events.Event) (*events.Ev
 func TestRecordResponseNamesThePersistedMessage(t *testing.T) {
 	h := userArcHistory(t)
 	persistor := &fakePersistor{next: 1}
-	agent, err := NewAgent(nil, nil, persistor, &scriptedLLM{})
+	agent, err := NewAgent(nil, nil, &scriptedLLM{})
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
@@ -45,7 +45,7 @@ func TestRecordResponseNamesThePersistedMessage(t *testing.T) {
 		history:   h,
 		arc:       h.Arcs[0],
 		foldState: history.FoldStateFromHistory(h),
-		sessionID: "session",
+		persistor: persistor,
 	}
 
 	vendorID := "chatcmpl-9"
@@ -74,8 +74,8 @@ func TestRecordResponseNamesThePersistedMessage(t *testing.T) {
 	if got := call.Payload.(events.ToolCallPayload).MessageID; got != message.ID {
 		t.Errorf("call names message %q, want %q", got, message.ID)
 	}
-	if message.SessionID != "session" || *message.CorrelationID != testArcID {
-		t.Errorf("message filed under session %q arc %v", message.SessionID, message.CorrelationID)
+	if *message.CorrelationID != testArcID {
+		t.Errorf("message filed under arc %v, want %s", message.CorrelationID, testArcID)
 	}
 
 	// The fold is what the next step reads, so the reply has to have landed in
@@ -147,13 +147,14 @@ func TestRunCallsToolsAndClosesTheArc(t *testing.T) {
 		{ModelID: "gpt-5", Content: "two pods are pending"},
 	}}
 
-	agent, err := NewAgent(&AgentConfig{}, registry, &fakePersistor{next: 1}, llm)
+	persistor := &fakePersistor{next: 1}
+	agent, err := NewAgent(&AgentConfig{}, registry, llm)
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
 	h := userArcHistory(t)
-	if err := agent.Run(context.Background(), "session", h, testArcID); err != nil {
+	if err := agent.Run(context.Background(), persistor, h, testArcID); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -192,13 +193,14 @@ func TestRunSettlesABrokenToolAsFailed(t *testing.T) {
 		{ModelID: "gpt-5", Content: "the cluster is unreachable"},
 	}}
 
-	agent, err := NewAgent(nil, registry, &fakePersistor{next: 1}, llm)
+	persistor := &fakePersistor{next: 1}
+	agent, err := NewAgent(nil, registry, llm)
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
 	h := userArcHistory(t)
-	if err := agent.Run(context.Background(), "session", h, testArcID); err != nil {
+	if err := agent.Run(context.Background(), persistor, h, testArcID); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -211,14 +213,11 @@ func TestRunSettlesABrokenToolAsFailed(t *testing.T) {
 	}
 }
 
-func TestNewAgentRequiresAPersistorAndAModel(t *testing.T) {
-	if _, err := NewAgent(nil, nil, nil, &scriptedLLM{}); err == nil {
-		t.Error("an agent with no persistor was accepted")
-	}
-	if _, err := NewAgent(nil, nil, &fakePersistor{}, nil); err == nil {
+func TestNewAgentRequiresAModel(t *testing.T) {
+	if _, err := NewAgent(nil, nil, nil); err == nil {
 		t.Error("an agent with no model was accepted")
 	}
-	agent, err := NewAgent(nil, nil, &fakePersistor{}, &scriptedLLM{})
+	agent, err := NewAgent(nil, nil, &scriptedLLM{})
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
@@ -227,17 +226,34 @@ func TestNewAgentRequiresAPersistorAndAModel(t *testing.T) {
 	}
 }
 
+// A run with nowhere to write is stopped before the model is called, since
+// everything it decided would be lost the moment it decided it.
+func TestRunRequiresAPersistor(t *testing.T) {
+	llm := &scriptedLLM{}
+	agent, err := NewAgent(nil, nil, llm)
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	if err := agent.Run(context.Background(), nil, userArcHistory(t), testArcID); err == nil {
+		t.Error("a run with no persistor was accepted")
+	}
+	if llm.calls != 0 {
+		t.Error("the model was called for a run that had nowhere to record it")
+	}
+}
+
 // runFailing runs one arc against a model that fails, and returns the history
 // it left behind.
 func runFailing(t *testing.T, failure error) *history.History {
 	t.Helper()
-	agent, err := NewAgent(nil, nil, &fakePersistor{next: 1}, &scriptedLLM{failure: failure})
+	persistor := &fakePersistor{next: 1}
+	agent, err := NewAgent(nil, nil, &scriptedLLM{failure: failure})
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
 	h := userArcHistory(t)
-	if err := agent.Run(context.Background(), "session", h, testArcID); !errors.Is(err, failure) {
+	if err := agent.Run(context.Background(), persistor, h, testArcID); !errors.Is(err, failure) {
 		t.Fatalf("Run returned %v, want the failure it hit", err)
 	}
 	return h
@@ -307,14 +323,14 @@ func TestALaterTurnIsToldTheArcFailed(t *testing.T) {
 // what stopped it and writes nothing.
 func TestACancelledRunRecordsNothing(t *testing.T) {
 	persistor := &fakePersistor{next: 1}
-	agent, err := NewAgent(nil, nil, persistor,
+	agent, err := NewAgent(nil, nil,
 		&scriptedLLM{failure: fmt.Errorf("calling the model: %w", context.Canceled)})
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
 	h := userArcHistory(t)
-	if err := agent.Run(context.Background(), "session", h, testArcID); !errors.Is(err, context.Canceled) {
+	if err := agent.Run(context.Background(), persistor, h, testArcID); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run returned %v, want an error carrying the cancellation", err)
 	}
 
@@ -342,12 +358,12 @@ func typesOf(stored []*events.Event) string {
 func TestAnUnrecordableFailureKeepsItsCause(t *testing.T) {
 	failure := errors.New("model not found")
 	persistor := &brokenPersistor{fakePersistor: fakePersistor{next: 1}}
-	agent, err := NewAgent(nil, nil, persistor, &scriptedLLM{failure: failure})
+	agent, err := NewAgent(nil, nil, &scriptedLLM{failure: failure})
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
-	err = agent.Run(context.Background(), "session", userArcHistory(t), testArcID)
+	err = agent.Run(context.Background(), persistor, userArcHistory(t), testArcID)
 	if !errors.Is(err, failure) {
 		t.Errorf("Run returned %v, want the cause it started with", err)
 	}
@@ -377,7 +393,7 @@ func TestAHandlerThatReturnsUnderCancellationIsStillRecorded(t *testing.T) {
 	})
 
 	persistor := &fakePersistor{next: 1}
-	agent, err := NewAgent(nil, registry, persistor, &scriptedLLM{replies: []*LLMResponse{
+	agent, err := NewAgent(nil, registry, &scriptedLLM{replies: []*LLMResponse{
 		{ModelID: "gpt-5", ToolCalls: []LLMToolCall{{VendorID: "call_abc", ToolName: "restart_deployment"}}},
 	}})
 	if err != nil {
@@ -385,7 +401,7 @@ func TestAHandlerThatReturnsUnderCancellationIsStillRecorded(t *testing.T) {
 	}
 
 	h := userArcHistory(t)
-	if err := agent.Run(ctx, "session", h, testArcID); !errors.Is(err, context.Canceled) {
+	if err := agent.Run(ctx, persistor, h, testArcID); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run returned %v, want the cancellation", err)
 	}
 
