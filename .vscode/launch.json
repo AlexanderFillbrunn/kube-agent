@@ -1,0 +1,34 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "devchat (OpenAI)",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/devchat",
+      // The harness is a full-screen terminal app, and only the integrated
+      // terminal gives it a real terminal to draw on.
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/.env",
+      "args": ["-store", "${workspaceFolder}/.devchat/session.jsonl"]
+    },
+    {
+      "name": "devchat (local endpoint)",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/devchat",
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/.env",
+      "args": [
+        "-store",
+        "${workspaceFolder}/.devchat/session.jsonl",
+        "-base-url",
+        "http://localhost:11434/v1",
+        "-model",
+        "qwen2.5"
+      ]
+    }
+  ]
+}

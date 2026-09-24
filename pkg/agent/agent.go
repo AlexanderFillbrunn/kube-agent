@@ -1,0 +1,395 @@
+package agent
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+
+	"fillbrunn.ai/kube-agent/pkg/events"
+	"fillbrunn.ai/kube-agent/pkg/history"
+)
+
+var (
+	InvalidArcStateError = errors.New("invalid arc state")
+)
+
+type arcState int
+
+const (
+	ArcStateNone      arcState = iota
+	ArcStateLLM		  arcState = iota
+	ArcStateToolCalls arcState = iota
+	ArcStateDone      arcState = iota
+	ArcStateClose	  arcState = iota
+)
+
+type AgentConfig struct {
+	SystemPrompt string
+
+	// Tokens receives the model's text as it streams. A nil sink discards it:
+	// the reply is recorded whole whatever happens here, so a run nobody is
+	// watching loses nothing.
+	Tokens Sink[string]
+
+	// Observer is handed every event once it has been folded, so that a caller
+	// can follow a run as it happens rather than read it afterwards. It only
+	// watches: nothing it does changes what the agent decides, and an observer
+	// that fails stops the run rather than being ignored.
+	Observer Sink[*events.Event]
+}
+
+type Agent struct {
+	config *AgentConfig
+	tools *ToolRegistry
+	events EventPersistor
+	llm LLM
+}
+
+// NewAgent builds an agent from the parts it runs on. A nil config or registry
+// is an agent with no system prompt and no tools, which is a usable agent; a
+// missing persistor or model is not, since neither has a sane default.
+func NewAgent(config *AgentConfig, tools *ToolRegistry, persistor EventPersistor, llm LLM) (*Agent, error) {
+	if persistor == nil {
+		return nil, errors.New("an agent needs an event persistor")
+	}
+	if llm == nil {
+		return nil, errors.New("an agent needs a model")
+	}
+	if config == nil {
+		config = &AgentConfig{}
+	}
+	if tools == nil {
+		tools = NewToolRegistry()
+	}
+	return &Agent{config: config, tools: tools, events: persistor, llm: llm}, nil
+}
+
+type agentState struct {
+	history *history.History
+	arc *history.Arc
+	foldState *history.FoldState
+	sessionID string
+}
+
+// Run invokes the agent to complete an arc, i.e. a user message triggering the agent.
+func (a Agent) Run(ctx context.Context, sessionID string, h *history.History, arcID string) error {
+	var arc *history.Arc
+	for _, a := range slices.Backward(h.Arcs) {
+		if a.ID == arcID {
+			arc = a
+			break
+		}
+	}
+	if arc == nil {
+		return fmt.Errorf("arc not found in history: %s", arcID)
+	}
+
+	foldState := history.FoldStateFromHistory(h)
+
+	state := &agentState{
+		history: h,
+		arc: arc,
+		foldState: foldState,
+		sessionID: sessionID,
+	}
+
+	if err := a.steps(ctx, state); err != nil {
+		return a.recordFailure(ctx, err, state)
+	}
+	return nil
+}
+
+// recordFailure closes an arc the agent could not finish, and returns the
+// error that ended it.
+//
+// A run that fails without writing anything leaves an arc the log cannot tell
+// from one still being worked on, and every later request is projected against
+// that: the model is told an answer is coming that never will. So a failure is
+// a record like any other. A deadline is one of these, since nobody withdrew
+// the work; it ran out of time.
+//
+// A cancelled run writes nothing. Cancelling is not the agent's decision to
+// make or to report: whoever decided it records it and then stops the run,
+// and an agent writing its own cancel would be claiming an authority it does
+// not have and an actor it does not know.
+func (a Agent) recordFailure(ctx context.Context, cause error, state *agentState) error {
+	if errors.Is(cause, context.Canceled) {
+		return cause
+	}
+
+	failure := &events.Event{
+		Typ:           events.ErrorEventType,
+		SessionID:     state.sessionID,
+		CorrelationID: &state.arc.ID,
+		Payload:       events.ErrorPayload{Message: cause.Error(), IsFatal: true},
+	}
+
+	// The context that ended the run cannot be the one that records it: a
+	// cancelled context would refuse the very write that says so.
+	if _, err := a.persistAndFold(context.WithoutCancel(ctx), failure, state); err != nil {
+		// The cause is what went wrong; that it could not be written down is
+		// a second failure, and neither is worth losing.
+		return errors.Join(cause, err)
+	}
+	return cause
+}
+
+// steps runs the agent loop until it is the user#s turn again.
+func (a Agent) steps(ctx context.Context, state *agentState) error {
+	done := false
+	for !done {
+		d, err := a.step(ctx, state)
+		if err != nil {
+			return err
+		}
+		done = d
+	}
+
+	return nil
+}
+
+// Step performs one step in the agent loop.
+func (a Agent) step(ctx context.Context, state *agentState) (bool, error) {
+	s, err := a.deriveArcState(state.arc)
+	if err != nil {
+		return true, err
+	}
+	switch s {
+	case ArcStateLLM:
+		return false, a.llmStep(ctx, state)
+	case ArcStateToolCalls:
+		return false, a.toolStep(ctx, state)
+	case ArcStateClose:
+		return false, a.closeArc(ctx, state)
+	case ArcStateNone:
+		return true, InvalidArcStateError
+	}
+	return true, nil
+}
+
+func (a Agent) closeArc(ctx context.Context, state *agentState) error {
+	// The close names the response that concluded the arc, and the fold
+	// rejects a close naming no message it knows.
+	if len(state.arc.Responses) == 0 {
+		return fmt.Errorf("cannot close arc %s: no response to name as its conclusion", state.arc.ID)
+	}
+	last := state.arc.Responses[len(state.arc.Responses)-1]
+
+	_, err := a.persistAndFold(ctx, &events.Event{
+		Typ: events.ArcClosedEventType,
+		SessionID: state.sessionID,
+		/* assigned by persistor
+		ID: uuid.New().String(),
+		Seq: state.history.LastSeq + 1,
+		Timestamp: time.Now(),
+		*/
+		CorrelationID: &state.arc.ID,
+		Payload: events.ArcClosedPayload{CausationID: last.ID},
+	}, state)
+	return err
+}
+
+// persistAndFold writes one event and folds it into the history, returning the
+// event as it was persisted. The persistor assigns the ID, sequence number and
+// timestamp, so a caller that has to name this event in a later one reads them
+// from what comes back rather than inventing them.
+func (a Agent) persistAndFold(ctx context.Context, ev *events.Event, state *agentState) (*events.Event, error) {
+	newEv, err := a.events.Persist(ctx, ev)
+	if err != nil {
+		return nil, fmt.Errorf("error persisting %s event: %w", ev.Typ, err)
+	}
+	if err := state.history.Update(newEv, state.foldState); err != nil {
+		return nil, fmt.Errorf("error folding %s event: %w", newEv.Typ, err)
+	}
+	// The observer is told after the fold, so that what it sees and what the
+	// next step reads are the same history.
+	if a.config.Observer != nil {
+		if err := a.config.Observer.Consume(newEv); err != nil {
+			return nil, fmt.Errorf("error observing %s event: %w", newEv.Typ, err)
+		}
+	}
+	return newEv, nil
+}
+
+// llmStep calls the LLM with the history so far and records what it replied.
+func (a Agent) llmStep(ctx context.Context, state *agentState) error {
+	tokSink := a.config.Tokens
+	if tokSink == nil {
+		tokSink = SinkFromFunc(func(string) error { return nil })
+	}
+
+	response, err := a.llm.StreamResponse(ctx, state.history, &LLMOptions{
+		SystemPrompt: a.config.SystemPrompt,
+		Tools:        a.tools,
+	}, tokSink)
+	if err != nil {
+		return fmt.Errorf("error calling LLM: %w", err)
+	}
+	return a.recordResponse(ctx, response, state)
+}
+
+// recordResponse writes a reply to the log: the message first, then one event
+// per call it requested, each naming the message the persistor just gave an ID
+// to.
+func (a Agent) recordResponse(ctx context.Context, response *LLMResponse, state *agentState) error {
+	message, err := a.persistAndFold(ctx, &events.Event{
+		Typ:           events.AssistantMessageEventType,
+		SessionID:     state.sessionID,
+		CorrelationID: &state.arc.ID,
+		Payload: events.AssistantMessagePayload{
+			VendorID:  response.VendorID,
+			ModelID:   response.ModelID,
+			Content:   response.Content,
+			Reasoning: response.Reasoning,
+			Usage:     recordedUsage(response.Usage),
+		},
+	}, state)
+	if err != nil {
+		return err
+	}
+
+	if err := a.recordToolCalls(ctx, response.ToolCalls, message.ID, state); err != nil {
+		return err
+	}
+	return nil
+}
+
+// recordedUsage carries a reply's cost into the record of it. Nothing is
+// written where the provider reported nothing, so a zero in the log always
+// means a measured zero.
+func recordedUsage(usage *TokenUsage) *events.TokenUsage {
+	if usage == nil {
+		return nil
+	}
+	return &events.TokenUsage{
+		Input:       usage.Input,
+		CachedInput: usage.CachedInput,
+		Output:      usage.Output,
+	}
+}
+
+// recordToolCalls writes the calls one message requested, each naming it.
+func (a Agent) recordToolCalls(ctx context.Context, calls []LLMToolCall, messageID string, state *agentState) error {
+	for _, call := range calls {
+		_, err := a.persistAndFold(ctx, &events.Event{
+			Typ:           events.ToolCallEventType,
+			SessionID:     state.sessionID,
+			CorrelationID: &state.arc.ID,
+			Payload: events.ToolCallPayload{
+				MessageID: messageID,
+				VendorID:  call.VendorID,
+				ToolName:  call.ToolName,
+				Args:      call.Args,
+			},
+		}, state)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// toolStep runs every call the arc is still waiting on, in the order they were
+// requested.
+//
+// Every pending call it finds has to end settled. The loop decides what to do
+// next by reading the arc, so a call left pending is a call the agent asks
+// itself about again, and again.
+func (a Agent) toolStep(ctx context.Context, state *agentState) error {
+	// The calls are collected before any of them runs, because running one
+	// writes to the arc being read.
+	var pending []*history.ToolCall
+	for _, response := range state.arc.Responses {
+		for _, call := range response.ToolCalls {
+			if call.Status == history.ToolCallStatusPending {
+				pending = append(pending, call)
+			}
+		}
+	}
+
+	for _, call := range pending {
+		if err := a.runToolCall(ctx, call, state); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// runToolCall records that a call was handed to its tool, runs it, and records
+// what came back.
+//
+// The dispatch is written first and on purpose: a worker that dies mid-call
+// leaves that record with no result behind it, which is how the next run tells
+// a call that may have taken effect from one that provably never ran.
+func (a Agent) runToolCall(ctx context.Context, call *history.ToolCall, state *agentState) error {
+	if _, err := a.persistAndFold(ctx, &events.Event{
+		Typ:           events.ToolDispatchedEventType,
+		SessionID:     state.sessionID,
+		CorrelationID: &state.arc.ID,
+		Payload:       events.ToolDispatchedPayload{CausationID: call.ID},
+	}, state); err != nil {
+		return err
+	}
+
+	outcome, err := a.tools.Invoke(ctx, call.ToolName, call.Args)
+	if err != nil {
+		// A tool that broke is still an outcome, and one the model is told
+		// about so it can do something else. Cancellation is not: the run is
+		// over, and whoever cancelled it settles the arc.
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		outcome = ToolOutcome{Result: err.Error(), IsError: true}
+	}
+
+	_, err = a.persistAndFold(ctx, &events.Event{
+		Typ:           events.ToolResultEventType,
+		SessionID:     state.sessionID,
+		CorrelationID: &state.arc.ID,
+		Payload: events.ToolResultPayload{
+			CausationID: call.ID,
+			Result:      outcome.Result,
+			IsError:     outcome.IsError,
+		},
+	}, state)
+	return err
+}
+
+// deriveArcState decides what the agent does next by reading the arc alone, so
+// a run that picks up an arc another run left behind reaches the same decision.
+func (a Agent) deriveArcState(arc *history.Arc) (arcState, error) {
+	if arc.Status() != history.ArcStatusPending {
+		return ArcStateDone, nil
+	}
+	if len(arc.Responses) == 0 {
+		return ArcStateLLM, nil
+	}
+
+	for _, r := range arc.Responses {
+		for _, tc := range r.ToolCalls {
+			if tc.Status != history.ToolCallStatusPending {
+				continue
+			}
+			if _, ok := a.tools.Get(tc.ToolName); !ok {
+				return ArcStateNone, fmt.Errorf("tool not registered: %s", tc.ToolName)
+			}
+			return ArcStateToolCalls, nil
+		}
+	}
+
+	last := arc.Responses[len(arc.Responses)-1]
+	if len(last.ToolCalls) == 0 {
+		// A task outlives the response that started it, so an arc holding one
+		// is not finished however final that response reads. Closing here
+		// would leave the model unable to account for work it started, and the
+		// task's own result is what starts the next run.
+		for _, task := range arc.AsyncTasks {
+			if task.FinishedSeq == nil {
+				return ArcStateDone, nil
+			}
+		}
+		return ArcStateClose, nil
+	}
+	return ArcStateLLM, nil
+}
