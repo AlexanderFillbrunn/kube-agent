@@ -8,10 +8,10 @@ import (
 	"fillbrunn.ai/kube-agent/pkg/events"
 )
 
-// CancelledError reports that the arc was cancelled while the agent was
+// ErrCancelled reports that the arc was cancelled while the agent was
 // working on it. Whoever decided the cancel recorded it, so a caller seeing
 // this has nothing left to write: the arc is closed and the run is over.
-var CancelledError = errors.New("the arc was cancelled")
+var ErrCancelled = errors.New("the arc was cancelled")
 
 // CancelSource answers whether an arc has been cancelled.
 //
@@ -62,7 +62,7 @@ func (g *guardedPersistor) Persist(ctx context.Context, ev *events.Event) (*even
 	arcID := *ev.CorrelationID
 
 	if g.seen[arcID] {
-		return nil, fmt.Errorf("%w: arc %s", CancelledError, arcID)
+		return nil, fmt.Errorf("%w: arc %s", ErrCancelled, arcID)
 	}
 
 	cancel, err := g.cancels.Cancelled(ctx, arcID)
@@ -81,7 +81,7 @@ func (g *guardedPersistor) Persist(ctx context.Context, ev *events.Event) (*even
 	}
 	g.seen[arcID] = true
 
-	return nil, fmt.Errorf("%w: arc %s, %s not written", CancelledError, arcID, ev.Typ)
+	return nil, fmt.Errorf("%w: arc %s, %s not written", ErrCancelled, arcID, ev.Typ)
 }
 
 // startsWork reports whether an event is written before something happens

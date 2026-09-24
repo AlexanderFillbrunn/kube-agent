@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"fillbrunn.ai/kube-agent/pkg/agent"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -40,6 +41,25 @@ func registerFakeTools(registry *agent.ToolRegistry) error {
 				},
 			},
 			handler: listPods,
+		},
+		{
+			tool: &mcp.Tool{
+				Name: "wait",
+				Description: fmt.Sprintf(
+					"Wait for a number of seconds and report how long it waited. Waits longer than %s are shortened to it.",
+					maxWait),
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"seconds": map[string]any{
+							"type":        "number",
+							"description": "How long to wait.",
+						},
+					},
+					"required": []any{"seconds"},
+				},
+			},
+			handler: wait,
 		},
 		{
 			tool: &mcp.Tool{
@@ -93,6 +113,52 @@ func listPods(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult,
 		return toolError(fmt.Sprintf("no namespace %q", args.Namespace)), nil
 	}
 	return structured(map[string]any{"pods": matched})
+}
+
+// maxWait bounds the wait tool. It is there so that a model asking for an
+// hour cannot tie up the harness, and so the wait stays short enough to sit
+// through while testing a cancel.
+var maxWait = 15 * time.Second
+
+// wait does nothing for a while, which is what makes it useful: it is the one
+// tool here slow enough to cancel halfway.
+//
+// It touches nothing, so an interrupted wait has no question hanging over it
+// the way restartDeployment does. It still reports through IsError rather than
+// a returned error, because it did not do what it was asked.
+func wait(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	var args struct {
+		Seconds float64 `json:"seconds"`
+	}
+	if err := decodeArgs(req, &args); err != nil {
+		return toolError(err.Error()), nil
+	}
+	if args.Seconds < 0 {
+		return toolError("seconds cannot be negative"), nil
+	}
+
+	asked := time.Duration(args.Seconds * float64(time.Second))
+	waiting := min(asked, maxWait)
+
+	timer := time.NewTimer(waiting)
+	defer timer.Stop()
+
+	started := time.Now()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+		return toolError(fmt.Sprintf(
+			"stopped after %s of a %s wait (%v)", time.Since(started).Round(time.Millisecond), waiting, ctx.Err())), nil
+	}
+
+	result := map[string]any{"waited_seconds": waiting.Seconds()}
+	if waiting < asked {
+		// The model asked for something it did not get, and a tool that
+		// quietly returns less than it was asked for invites the model to
+		// believe the wait was honoured.
+		result["note"] = fmt.Sprintf("%s was asked for, which is longer than the %s limit", asked, maxWait)
+	}
+	return structured(result)
 }
 
 func restartDeployment(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {

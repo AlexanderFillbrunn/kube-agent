@@ -933,7 +933,10 @@ func (h *History) applyCancel(ev *events.Event, state *FoldState) error {
 	if ev.CorrelationID == nil {
 		return fmt.Errorf("event %q of type %q has no correlation ID", ev.ID, ev.Typ)
 	}
-	arc := state.arcs[*ev.CorrelationID]
+	arc, ok := state.arcs[*ev.CorrelationID]
+	if !ok {
+		return fmt.Errorf("no arc with ID=%s found for cancel", *ev.CorrelationID)
+	}
 
 	stoppedSomething := false
 

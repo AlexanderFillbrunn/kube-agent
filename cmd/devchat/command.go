@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -8,9 +9,9 @@ import (
 )
 
 // A line starting with a slash is an instruction to the harness rather than
-// something to say to the model. Commands only run between turns: the guard
-// that ignores enter while the agent is working covers them too, so nothing
-// here has to reason about a run in flight.
+// something to say to the model. Most commands only run between turns, and the
+// few that do not say so: a command that can reach into a run has to be
+// written for one, and the default is the assumption that it was not.
 
 // slashCommand is one thing that can be typed instead of a message.
 type slashCommand struct {
@@ -21,12 +22,25 @@ type slashCommand struct {
 	arg     string
 	summary string
 
+	// duringTurn lets a command be typed while the agent is working. It is off
+	// by default because the others would be wrong there: switching model
+	// halfway through a run leaves the arc split between two, and clearing
+	// moves the log out from under a run still writing to it.
+	duringTurn bool
+
 	// run is given whatever followed the command name, trimmed.
 	run func(model, string) (model, tea.Cmd)
 }
 
 // commands are shown in the order they are listed.
 var commands = []slashCommand{
+	{
+		name:       "/cancel",
+		arg:        "[why]",
+		summary:    "stop the run",
+		duringTurn: true,
+		run:        cancelTurn,
+	},
 	{
 		name:    "/model",
 		arg:     "<name>",
@@ -50,6 +64,19 @@ func isCommand(line string) bool {
 	return strings.HasPrefix(line, "/")
 }
 
+// runsDuringTurn reports whether a typed line is one of the commands that may
+// be sent while the agent is working. An unknown command is not, so that a
+// mistyped one is answered between turns rather than mid-run.
+func runsDuringTurn(line string) bool {
+	name, _, _ := strings.Cut(line, " ")
+	for _, command := range commands {
+		if command.name == name {
+			return command.duringTurn
+		}
+	}
+	return false
+}
+
 // runCommand dispatches a typed line. An unknown command is answered rather
 // than sent to the model, since a mistyped command is not a question.
 func runCommand(m model, line string) (model, tea.Cmd) {
@@ -61,6 +88,33 @@ func runCommand(m model, line string) (model, tea.Cmd) {
 	}
 
 	m.transcript.note(fmt.Sprintf("no command %s. there is %s", name, strings.Join(commandNames(), ", ")))
+	return m.refresh(), nil
+}
+
+// cancelTurn withdraws the run in progress.
+//
+// The record goes down before the run is stopped. Stopping first would leave a
+// window where the run has ended and the log still shows an arc being worked
+// on, and it is the log a resumed session reads.
+//
+// Nothing is printed here for the cancel itself: stopping the run brings the
+// turn back through turnDoneMsg, which says so once. A reason is not echoed
+// either, since the model is the one it was written for.
+func cancelTurn(m model, reason string) (model, tea.Cmd) {
+	if !m.running() {
+		m.transcript.note("nothing is running")
+		return m.refresh(), nil
+	}
+
+	if err := m.session.cancel(context.Background(), m.arc, reason); err != nil {
+		// The run is left alone. A cancel that was not recorded would stop the
+		// run and leave the log saying the arc is still being worked on, and a
+		// stuck run is easier to explain than a log that disagrees with it.
+		m.transcript.fail(err)
+		return m.refresh(), nil
+	}
+	m.cancel()
+
 	return m.refresh(), nil
 }
 

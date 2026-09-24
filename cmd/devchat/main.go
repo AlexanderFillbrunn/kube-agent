@@ -11,8 +11,9 @@
 //
 // Type a message and the agent runs until it is your turn again, with the
 // reply arriving as it is written and each tool call showing what it is doing.
-// Enter sends, esc leaves, and ctrl+c stops a run in progress rather than the
-// program.
+// Enter sends and esc leaves. A run in progress is stopped by ctrl+c or by
+// /cancel, which takes a reason the model is told about; either way the arc is
+// withdrawn in the log rather than merely dropped on the screen.
 //
 // Sessions are kept under .devchat/ rather than beside the source. Pointing
 // -store at a log again resumes that conversation, and /clear moves the

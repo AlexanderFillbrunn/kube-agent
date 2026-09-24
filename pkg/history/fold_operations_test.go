@@ -569,3 +569,20 @@ func TestCancelTerminatedWorkFollowsTheClose(t *testing.T) {
 		t.Errorf("cancel = %#v, want TerminatedWork true for an arc the agent never closed", cancel)
 	}
 }
+
+// A cancel naming an arc the fold never saw is a broken log, and the fold has
+// to say so rather than dereference the arc it did not find.
+func TestCancelForAnUnknownArcIsRejected(t *testing.T) {
+	start := time.Date(2026, time.September, 19, 10, 0, 0, 0, time.UTC)
+	user := users.Actor{UserID: "user-1"}
+
+	known, unknown := "arc-1", "arc-2"
+	log := []events.Event{
+		{ID: known, Seq: 0, Timestamp: start, Typ: events.UserMessageEventType, CorrelationID: &known, Actor: user, Payload: events.UserMessagePayload{Content: "audit the cluster", Actor: user}},
+		{ID: "cancel-1", Seq: 1, Timestamp: start.Add(time.Second), Typ: events.CancelEventType, CorrelationID: &unknown, Actor: user, Payload: events.CancelPayload{}},
+	}
+
+	if _, err := Replay("session-1", log); err == nil {
+		t.Fatal("a cancel against an arc that is not in the log was folded without complaint")
+	}
+}

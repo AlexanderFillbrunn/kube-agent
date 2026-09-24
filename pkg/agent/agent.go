@@ -11,7 +11,7 @@ import (
 )
 
 var (
-	InvalidArcStateError = errors.New("invalid arc state")
+	ErrInvalidArcState = errors.New("invalid arc state")
 )
 
 type arcState int
@@ -123,7 +123,7 @@ func (a Agent) recordFailure(ctx context.Context, cause error, state *agentState
 	// A cancel reaches a run two ways — the context it was given, and a write
 	// the store would not take — and neither is a failure to record. The arc
 	// is already closed by the cancel that stopped it.
-	if errors.Is(cause, context.Canceled) || errors.Is(cause, CancelledError) {
+	if errors.Is(cause, context.Canceled) || errors.Is(cause, ErrCancelled) {
 		return cause
 	}
 
@@ -171,7 +171,7 @@ func (a Agent) step(ctx context.Context, state *agentState) (bool, error) {
 	case ArcStateClose:
 		return false, a.closeArc(ctx, state)
 	case ArcStateNone:
-		return true, InvalidArcStateError
+		return true, ErrInvalidArcState
 	}
 	return true, nil
 }

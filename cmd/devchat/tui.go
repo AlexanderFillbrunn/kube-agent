@@ -65,6 +65,11 @@ type model struct {
 	// cancel stops the run in progress, and is nil when nothing is running.
 	cancel context.CancelFunc
 
+	// arc names what the run in progress is working on, and is empty when
+	// nothing is running. A cancel is recorded against an arc, so the name has
+	// to be to hand before the run has written anything to read it from.
+	arc string
+
 	width  int
 	height int
 	ready  bool
@@ -115,11 +120,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case turnDoneMsg:
 		m.cancel = nil
+		m.arc = ""
 		switch {
 		case msg.err == nil:
-		case errors.Is(msg.err, context.Canceled):
-			// The agent recorded the cancel; the screen only has to say the
-			// run is over, not repeat it as a failure.
+		case errors.Is(msg.err, context.Canceled), errors.Is(msg.err, agent.ErrCancelled):
+			// The cancel is already written down, so the screen only has to
+			// say the run is over rather than repeat it as a failure. A run
+			// the guard refused a write to reads the same way to whoever asked
+			// for it, and arrives as ErrCancelled instead.
 			m.transcript.note("stopped")
 		default:
 			m.transcript.fail(msg.err)
@@ -144,10 +152,11 @@ func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c":
 		// While a run is in flight, the interrupt belongs to the run: the
-		// agent stops where it is and the log keeps what it had written.
+		// agent stops where it is and the log keeps what it had written. It
+		// goes the same way as /cancel, since it is the same decision and the
+		// two must not leave the log in different states.
 		if m.running() {
-			m.cancel()
-			return m, nil
+			return cancelTurn(m, "")
 		}
 		return m, tea.Quit
 
@@ -158,17 +167,24 @@ func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case "enter":
-		if m.running() {
-			return m, nil
-		}
 		message := strings.TrimSpace(m.input.Value())
 		if message == "" {
 			return m, nil
 		}
-		m.input.Reset()
 		if isCommand(message) {
+			// A command that is not written for a run in flight is left in the
+			// input rather than dropped, so it can be sent once the turn is
+			// over instead of typed again.
+			if m.running() && !runsDuringTurn(message) {
+				return m, nil
+			}
+			m.input.Reset()
 			return runCommand(m, message)
 		}
+		if m.running() {
+			return m, nil
+		}
+		m.input.Reset()
 		return m.start(message)
 	}
 
@@ -182,12 +198,14 @@ func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 func (m model) start(message string) (tea.Model, tea.Cmd) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
+	m.arc = m.session.newArcID()
 
 	session := m.session
 	sender := m.sender
+	arc := m.arc
 	go func() {
 		defer cancel()
-		sender.send(turnDoneMsg{err: session.turn(ctx, message)})
+		sender.send(turnDoneMsg{err: session.turn(ctx, arc, message)})
 	}()
 
 	// The user's own message is shown without waiting for the log, so that
@@ -263,7 +281,7 @@ func (m model) inputView() string {
 
 func (m model) helpView() string {
 	if m.running() {
-		return helpStyle.Render(fmt.Sprintf("%s working · ctrl+c stops it", m.spinner.View()))
+		return helpStyle.Render(fmt.Sprintf("%s working · /cancel [why] or ctrl+c stops it", m.spinner.View()))
 	}
 	return helpStyle.Render(commandHelp() + " · enter send")
 }

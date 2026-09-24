@@ -66,7 +66,7 @@ func runGuarded(t *testing.T, cancels *cancelledArcs) (*history.History, *fakePe
 // arc the run is reading is settled rather than left looking open.
 func TestTheGuardStopsARunOnACancelledArc(t *testing.T) {
 	h, persistor, err := runGuarded(t, &cancelledArcs{arcs: map[string]*events.Event{testArcID: cancelOf(testArcID)}})
-	if !errors.Is(err, CancelledError) {
+	if !errors.Is(err, ErrCancelled) {
 		t.Fatalf("Run returned %v, want it to report the cancellation", err)
 	}
 
