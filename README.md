@@ -15,6 +15,11 @@ and the code follows them rather than the other way round:
     PROJECTION.md   what the model is told
     ENCODING.md     how it is carried
 
+A third is a proposal rather than a specification, and the code does not follow
+it:
+
+    ASYNC-TASKS.md  whether a task belongs to an arc or stands beside one
+
 Development harness
 --------------------
 `cmd/devchat` and `internal/filestore` exist to exercise the agent by hand.
