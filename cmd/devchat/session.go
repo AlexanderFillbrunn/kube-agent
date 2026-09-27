@@ -24,6 +24,10 @@ type session struct {
 	persistor agent.EventPersistor
 	agent     *agent.Agent
 	actor     users.Actor
+
+	// controller reaches the tasks an arc started, so that stopping the arc
+	// stops them too. It is nil for a session with no tasks.
+	controller agent.TaskController
 }
 
 // newArcID mints the identifier for an arc about to be opened.
@@ -68,13 +72,48 @@ func (s *session) cancel(ctx context.Context, arcID, reason string) error {
 	if reason != "" {
 		payload.Reason = &reason
 	}
-	_, err := s.persistor.Persist(ctx, &events.Event{
+	if _, err := s.persistor.Persist(ctx, &events.Event{
 		Typ:           events.CancelEventType,
 		CorrelationID: &arcID,
 		Actor:         s.actor,
 		Payload:       payload,
-	})
-	return err
+	}); err != nil {
+		return err
+	}
+	return s.stopTasks(ctx, arcID, reason)
+}
+
+// stopTasks asks whatever the arc started to stop.
+//
+// Which tasks those are is a question for the log, which is why nothing here
+// keeps a list: the arc holds its tasks and an unfinished one is one worth
+// asking about. Nothing is written. A cancel ends the waiting, and what became
+// of work already under way is the runner's to report.
+//
+// A task that cannot be reached is not worth failing the cancel over. The
+// cancel is recorded, the arc is stopped, and a task nobody can reach is one
+// the log already cannot account for.
+func (s *session) stopTasks(ctx context.Context, arcID, reason string) error {
+	if s.controller == nil {
+		return nil
+	}
+	h, err := s.arcHistory(ctx, arcID)
+	if err != nil {
+		return err
+	}
+	for _, arc := range h.Arcs {
+		if arc.ID != arcID {
+			continue
+		}
+		for _, task := range arc.AsyncTasks {
+			if task.FinishedSeq != nil {
+				continue
+			}
+			ref := agent.TaskRef{ArcID: arc.ID, ID: task.ID, Name: task.TaskName}
+			_ = s.controller.Cancel(ctx, ref, reason)
+		}
+	}
+	return nil
 }
 
 // arcHistory loads and folds the events one arc is run from.

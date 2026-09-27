@@ -73,6 +73,12 @@ func run(storePath, modelName, baseURL, systemPrompt, userID string) error {
 		return err
 	}
 
+	tasks := agent.NewTaskRegistry()
+	runner := newLocalTasks()
+	if err := runner.register(tasks); err != nil {
+		return err
+	}
+
 	opts := []agent.OpenAIOption{}
 	if baseURL != "" {
 		opts = append(opts, agent.WithBaseURL(baseURL))
@@ -101,29 +107,61 @@ func run(storePath, modelName, baseURL, systemPrompt, userID string) error {
 		// effect. Here that is only ever this process, so it earns its keep as
 		// the wiring rather than the feature.
 		llm,
+		agent.WithTasks(tasks, runner),
 	)
 	if err != nil {
 		return err
 	}
 
+	persistor := agent.StampIdentity(agent.GuardCancellation(store, store), storePath)
 	session := &session{
-		id:        storePath,
-		store:     store,
-		persistor: agent.StampIdentity(agent.GuardCancellation(store, store), storePath),
-		agent:     chat,
-		actor:     users.Actor{UserID: userID, TenantID: "dev"},
+		id:         storePath,
+		store:      store,
+		persistor:  persistor,
+		agent:      chat,
+		actor:      users.Actor{UserID: userID, TenantID: "dev"},
+		controller: runner,
 	}
+
+	// The inbound half. A task calls this rather than writing to the log, which
+	// is the path a job somewhere else would have to take, so the harness
+	// exercises it rather than going around it.
+	reports, err := agent.NewTaskReports(storePath, persistor, store, chat, agent.NewLocalLease())
+	if err != nil {
+		return err
+	}
+	runner.attach(reports,
+		func(ref agent.TaskRef, text string, state toolState) {
+			relay.send(taskMsg{ref: ref, text: text, state: state})
+		},
+		func(arcID string) { relay.send(taskOwedMsg{arcID: arcID}) },
+	)
 
 	// The conversation already on disk is shown before anything is asked, so
 	// a resumed session opens where it left off.
-	existing := newTranscript()
 	recorded, err := session.fullHistory(context.Background())
 	if err != nil {
 		return err
 	}
+
+	// A task in that log is one this process started and then died on, because
+	// the only runner here is this one. Left alone it would hold its arc open
+	// for ever and put a note about work in flight in front of the model on
+	// every turn from now on.
+	settled, err := agent.SettleAbandonedTasks(context.Background(), persistor, recorded)
+	if err != nil {
+		return err
+	}
+	if settled > 0 {
+		if recorded, err = session.fullHistory(context.Background()); err != nil {
+			return err
+		}
+	}
+
+	existing := newTranscript()
 	existing.fromHistory(recorded)
 
-	program := tea.NewProgram(newModel(session, relay, llm, storePath, existing))
+	program := tea.NewProgram(newModel(session, relay, llm, existing, reports))
 	relay.attach(program)
 
 	_, err = program.Run()

@@ -17,7 +17,7 @@ func modelOver(t *testing.T, store *filestore.Store) model {
 	t.Helper()
 	s := &session{id: "session", store: store, actor: users.Actor{UserID: "dev"}}
 	llm := agent.NewOpenAI("test-key", "gpt-5")
-	return newModel(s, &sender{}, llm, "log.jsonl", newTranscript()).resize(80, 24)
+	return newModel(s, &sender{}, llm, newTranscript(), nil).resize(80, 24)
 }
 
 // Clearing has to reach the log, or the next turn replays a conversation the

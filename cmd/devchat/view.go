@@ -41,10 +41,14 @@ var (
 			Foreground(lipgloss.Color("8")).
 			Italic(true).
 			PaddingLeft(2)
-	toolNameStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
-	dimStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	helpStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Padding(0, 1)
-	inputStyle    = lipgloss.NewStyle().
+	toolNameStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
+	taskBadgeStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("0")).
+			Background(lipgloss.Color("14")).
+			Padding(0, 1)
+	dimStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	helpStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Padding(0, 1)
+	inputStyle = lipgloss.NewStyle().
 			BorderStyle(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("8")).
 			Padding(0, 1)
@@ -63,6 +67,8 @@ var toolMarks = map[toolState]struct {
 	toolDone:    {"●", "10"},
 	toolFailed:  {"●", "9"},
 	toolUnknown: {"◑", "13"},
+	toolWaiting: {"◔", "14"},
+	toolStopped: {"◐", "8"},
 }
 
 // renderTranscript draws the conversation to a given width.
@@ -99,8 +105,26 @@ func renderBlock(b *block, width int) string {
 
 	case blockTool:
 		return renderTool(b, body)
+
+	case blockTask:
+		return renderTask(b, body)
 	}
 	return ""
+}
+
+// renderTask draws a task as a line that stays put and changes. A task reports
+// several times over minutes, and a new line per report would push the
+// conversation off the screen to say the same job is still going.
+func renderTask(b *block, width int) string {
+	mark := toolMarks[b.state]
+	glyph := lipgloss.NewStyle().Foreground(lipgloss.Color(mark.color)).Render(mark.glyph)
+
+	head := fmt.Sprintf("%s %s %s",
+		glyph,
+		toolNameStyle.Render("task "+b.tool),
+		dimStyle.Render(string(b.state)),
+	)
+	return head + "\n  " + dimStyle.Render(truncate(b.text, max(width-4, 10)))
 }
 
 // renderTool draws a call as two lines: what was asked for, and what came
@@ -128,14 +152,72 @@ func renderTool(b *block, width int) string {
 	return head + "\n  " + dimStyle.Render(arrow+" "+truncate(b.result, max(width-4, 10)))
 }
 
-// renderHeader draws the bar across the top.
-func renderHeader(modelName, storePath string, width int) string {
+// renderHeader draws the bar across the top: what this is, what it is talking
+// to, and a badge for every task still running.
+//
+// The bar stays one line whatever it holds, because the viewport is sized
+// against its height and a bar that wrapped would push the conversation about
+// as tasks came and went.
+func renderHeader(modelName string, tasks []string, width int) string {
 	title := titleStyle.Render("kube-agent")
-	subtitle := subtitleStyle.Render(modelName + " · " + storePath)
+	details := subtitleStyle.Render(modelName)
 
-	bar := lipgloss.JoinHorizontal(lipgloss.Top, title, subtitle)
-	if lipgloss.Width(bar) > width {
-		bar = lipgloss.JoinHorizontal(lipgloss.Top, title, subtitleStyle.Render(modelName))
+	room := width - lipgloss.Width(title) - lipgloss.Width(details)
+	if room < 0 {
+		return lipgloss.JoinHorizontal(lipgloss.Top, title, details)
 	}
-	return bar
+
+	// Names where they fit, and where not even one does, the count: the least
+	// a badge can say and still be worth the room.
+	badges := namedBadges(tasks, room)
+	if badges == "" {
+		badges = summaryBadge(tasks, room)
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, title, details, badges)
+}
+
+// namedBadges draws a badge per task, dropping them from the end until they fit
+// and counting off whatever was dropped. It is empty when not even one fits.
+//
+// They are dropped rather than cut short, because a badge is drawn with colour
+// codes around it and cutting one by character would slice through those and
+// leave the rest of the line wearing its background.
+func namedBadges(tasks []string, room int) string {
+	for count := len(tasks); count > 0; count-- {
+		badges := renderBadges(tasks[:count])
+		if dropped := len(tasks) - count; dropped > 0 {
+			badges += " " + taskBadgeStyle.Render(fmt.Sprintf("+%d", dropped))
+		}
+		if lipgloss.Width(badges) <= room {
+			return badges
+		}
+	}
+	return ""
+}
+
+// summaryBadge says how many tasks are running, for when no name fits.
+func summaryBadge(tasks []string, room int) string {
+	if len(tasks) == 0 {
+		return ""
+	}
+	badge := taskBadgeStyle.Render(fmt.Sprintf("%d %s", len(tasks), plural("task", len(tasks))))
+	if lipgloss.Width(badge)+1 > room {
+		return ""
+	}
+	return " " + badge
+}
+
+func plural(word string, n int) string {
+	if n == 1 {
+		return word
+	}
+	return word + "s"
+}
+
+func renderBadges(tasks []string) string {
+	badges := make([]string, 0, len(tasks))
+	for _, name := range tasks {
+		badges = append(badges, taskBadgeStyle.Render(name))
+	}
+	return " " + strings.Join(badges, " ")
 }

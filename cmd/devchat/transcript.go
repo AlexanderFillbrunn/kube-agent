@@ -25,6 +25,8 @@ const (
 	// blockNote is the harness speaking, rather than anyone in the
 	// conversation. Nothing in a note reaches the model.
 	blockNote
+	// blockTask is an async task: what it is, and the last thing it said.
+	blockTask
 )
 
 // toolState is how a call is doing, which is not its recorded status: a call
@@ -41,6 +43,11 @@ const (
 	// everything stopped. Whether it took effect is not known, and showing it
 	// as still running would claim work nobody is doing.
 	toolUnknown toolState = "unknown"
+	// toolWaiting is a task that has stopped to ask for something. Only a task
+	// reaches it: a tool call that is waiting is waiting on its own tool.
+	toolWaiting toolState = "waiting"
+	// toolStopped is a task whose runner reported that it was called off.
+	toolStopped toolState = "stopped"
 )
 
 type block struct {
@@ -48,7 +55,7 @@ type block struct {
 	author string
 	text   string
 
-	// Tool blocks only.
+	// Tool and task blocks only.
 	id     string
 	tool   string
 	args   string
@@ -68,10 +75,14 @@ type transcript struct {
 	// tools indexes tool blocks by the ID of the call that created them, so a
 	// dispatch or a result finds the line it belongs to.
 	tools map[string]*block
+
+	// tasks indexes task blocks by task ID, for the same reason: everything a
+	// task says lands on the one line that is already on the screen.
+	tasks map[string]*block
 }
 
 func newTranscript() *transcript {
-	return &transcript{tools: map[string]*block{}}
+	return &transcript{tools: map[string]*block{}, tasks: map[string]*block{}}
 }
 
 // fromHistory fills a transcript with a conversation that is already recorded.
@@ -99,7 +110,56 @@ func (t *transcript) fromHistory(h *history.History) {
 				})
 			}
 		}
+
+		// Tasks come after the arc's replies rather than in the order they
+		// were invoked. A task is shown as where it has got to, and where it
+		// has got to is a thing about now, not about the point in the
+		// conversation it was started at.
+		for _, task := range arc.AsyncTasks {
+			shown := &block{
+				kind:  blockTask,
+				id:    task.ID,
+				tool:  task.TaskName,
+				args:  compact(task.Args),
+				state: taskStateOf(task),
+				text:  taskTextOf(task),
+			}
+			t.blocks = append(t.blocks, shown)
+			t.tasks[task.ID] = shown
+		}
 	}
+}
+
+// taskStateOf reads how a task is doing from the log.
+func taskStateOf(task *history.AsyncTask) toolState {
+	switch task.Status {
+	case history.AsyncTaskSuccess:
+		return toolDone
+	case history.AsyncTaskFailed:
+		return toolFailed
+	case history.AsyncTaskCancelled:
+		return toolStopped
+	case history.AsyncTaskWaiting:
+		return toolWaiting
+	default:
+		return toolRunning
+	}
+}
+
+// taskTextOf is the last thing a task said, which for a finished one is what
+// it finished with and for a running one is whatever it reported last.
+func taskTextOf(task *history.AsyncTask) string {
+	if task.FinishedSeq != nil {
+		return compact(task.Result)
+	}
+	if len(task.Events) > 0 {
+		last := task.Events[len(task.Events)-1]
+		if last.Type == history.AsyncTaskEventInputRequested {
+			return "asks: " + compact(last.Payload)
+		}
+		return compact(last.Payload)
+	}
+	return "started"
 }
 
 // token adds streamed text to the reply being written.
@@ -160,9 +220,89 @@ func (t *transcript) event(ev *events.Event) {
 			called.result = compact(payload.Result)
 		}
 
+	case events.AsyncTaskInvokePayload:
+		started := &block{
+			kind:  blockTask,
+			id:    ev.ID,
+			tool:  payload.TaskName,
+			args:  compact(payload.Args),
+			state: toolRunning,
+			text:  "started",
+		}
+		t.blocks = append(t.blocks, started)
+		t.tasks[ev.ID] = started
+
+	case events.AsyncTaskEventPayload:
+		t.onTask(payload.CausationID, toolRunning, compact(payload.Payload))
+
+	case events.AsyncTaskInputRequestedPayload:
+		t.onTask(payload.CausationID, toolWaiting, "asks: "+payload.Message)
+
+	case events.AsyncTaskInputProvidedPayload:
+		t.onTask(payload.CausationID, toolRunning, "was told: "+payload.Message)
+
+	case events.AsyncTaskResultPayload:
+		state := toolDone
+		switch payload.Outcome {
+		case events.AsyncTaskOutcomeFailed:
+			state = toolFailed
+		case events.AsyncTaskOutcomeCancelled:
+			state = toolStopped
+		}
+		t.onTask(payload.CausationID, state, compact(payload.Result))
+
 	case events.ErrorPayload:
 		t.blocks = append(t.blocks, &block{kind: blockError, text: payload.Message})
 	}
+}
+
+// onTask puts the latest thing a task said on the line that task already has.
+// A task reports many times and each report replaces the last, because what a
+// reader wants from a line about a long job is where it has got to.
+func (t *transcript) onTask(taskID string, state toolState, text string) {
+	task, ok := t.tasks[taskID]
+	if !ok {
+		return
+	}
+	task.state = state
+	task.text = text
+}
+
+// taskSaid shows what a task reported.
+//
+// It comes from the task rather than from the log, because what the log holds
+// is written on a goroutine of its own and never passes the sink the interface
+// watches. The line it lands on is the same one the log's own records reach, so
+// a reopened session and a running one look alike.
+func (t *transcript) taskSaid(taskID, name, text string, state toolState) {
+	task, ok := t.tasks[taskID]
+	if !ok {
+		task = &block{kind: blockTask, id: taskID, tool: name}
+		t.blocks = append(t.blocks, task)
+		t.tasks[taskID] = task
+	}
+	task.text = text
+	task.state = state
+}
+
+// runningTasks names the tasks that have not finished, in the order they were
+// started.
+//
+// It reads the transcript rather than the log because the transcript is what
+// the interface already keeps up to date: a task reports from a goroutine of
+// its own, and re-reading the file on every redraw to say the same thing would
+// be work for nothing.
+//
+// A task waiting on input counts as running. It has not finished, and it is the
+// one most worth naming: somebody has to answer it.
+func (t *transcript) runningTasks() []string {
+	var names []string
+	for _, b := range t.blocks {
+		if b.kind == blockTask && (b.state == toolRunning || b.state == toolWaiting) {
+			names = append(names, b.tool)
+		}
+	}
+	return names
 }
 
 // note records something the harness has to say for itself.

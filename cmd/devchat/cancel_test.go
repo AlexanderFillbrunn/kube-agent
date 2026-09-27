@@ -44,7 +44,7 @@ func runningModel(t *testing.T, arc string) (model, context.Context, *filestore.
 		t.Fatalf("Persist: %v", err)
 	}
 
-	m := newModel(s, &sender{}, agent.NewOpenAI("test-key", "gpt-5"), "log.jsonl", newTranscript()).resize(80, 24)
+	m := newModel(s, &sender{}, agent.NewOpenAI("test-key", "gpt-5"), newTranscript(), nil).resize(80, 24)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	m.cancel = cancel

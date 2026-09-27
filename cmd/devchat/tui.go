@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 
@@ -24,6 +25,19 @@ type (
 	tokenMsg    string
 	eventMsg    struct{ event *events.Event }
 	turnDoneMsg struct{ err error }
+
+	// taskMsg is a running task saying something. It reaches the screen from
+	// the task itself rather than through the log, because what the log holds
+	// is written by the ingress on a goroutine of its own.
+	taskMsg struct {
+		ref   agent.TaskRef
+		text  string
+		state toolState
+	}
+
+	// taskOwedMsg says a task's report did not get its arc a turn, because
+	// something else held the arc. The arc is owed a run once that is over.
+	taskOwedMsg struct{ arcID string }
 )
 
 // sender hands messages to the program. It exists because the sinks have to be
@@ -59,8 +73,7 @@ type model struct {
 
 	// llm is held so that /model can point the session at another one. It is
 	// only ever changed between turns.
-	llm       *agent.OpenAI
-	storePath string
+	llm *agent.OpenAI
 
 	// cancel stops the run in progress, and is nil when nothing is running.
 	cancel context.CancelFunc
@@ -70,12 +83,20 @@ type model struct {
 	// to be to hand before the run has written anything to read it from.
 	arc string
 
+	// reports is where a task's news goes. It is held so the interface can
+	// come back to an arc whose report arrived while something else held it.
+	reports *agent.TaskReports
+
+	// owed are arcs a task reported on while they were busy. A report is in
+	// the log either way; what is missing is the turn it should have got.
+	owed []string
+
 	width  int
 	height int
 	ready  bool
 }
 
-func newModel(s *session, sender *sender, llm *agent.OpenAI, storePath string, existing *transcript) model {
+func newModel(s *session, sender *sender, llm *agent.OpenAI, existing *transcript, reports *agent.TaskReports) model {
 	input := textarea.New()
 	input.Placeholder = "Ask about the cluster…"
 	input.ShowLineNumbers = false
@@ -92,7 +113,7 @@ func newModel(s *session, sender *sender, llm *agent.OpenAI, storePath string, e
 		input:      input,
 		spinner:    spin,
 		llm:        llm,
-		storePath:  storePath,
+		reports:    reports,
 	}
 }
 
@@ -118,6 +139,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.transcript.event(msg.event)
 		return m.refresh(), nil
 
+	case taskMsg:
+		m.transcript.taskSaid(msg.ref.ID, msg.ref.Name, msg.text, msg.state)
+		return m.refresh(), nil
+
+	case taskOwedMsg:
+		return m.owe(msg.arcID)
+
 	case turnDoneMsg:
 		m.cancel = nil
 		m.arc = ""
@@ -132,7 +160,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		default:
 			m.transcript.fail(msg.err)
 		}
-		return m.refresh(), nil
+		// An arc a task reported on while this run held it is owed the turn
+		// that report should have got, and now is when it can have it.
+		return m.refresh().settleOwed()
 	}
 
 	var commands []tea.Cmd
@@ -218,11 +248,47 @@ func (m model) start(message string) (tea.Model, tea.Cmd) {
 	return m.refresh(), m.spinner.Tick
 }
 
+// owe remembers an arc whose task reported while something else was working
+// it, and gives it its turn if nothing is running now.
+func (m model) owe(arcID string) (tea.Model, tea.Cmd) {
+	if !slices.Contains(m.owed, arcID) {
+		m.owed = append(m.owed, arcID)
+	}
+	return m.settleOwed()
+}
+
+// settleOwed works the first arc that is owed a turn, if the interface is free
+// to. One at a time: the next is picked up when this run reports it is done,
+// which is also what keeps two runs off one arc from this side.
+func (m model) settleOwed() (tea.Model, tea.Cmd) {
+	if m.running() || len(m.owed) == 0 || m.reports == nil {
+		return m, nil
+	}
+	arc := m.owed[0]
+	m.owed = m.owed[1:]
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancel = cancel
+	m.arc = arc
+
+	reports, sender := m.reports, m.sender
+	go func() {
+		defer cancel()
+		worked, err := reports.Work(ctx, arc)
+		if err == nil && !worked {
+			// Still held by somebody. The turn is still owed.
+			sender.send(taskOwedMsg{arcID: arc})
+		}
+		sender.send(turnDoneMsg{err: err})
+	}()
+	return m.refresh(), m.spinner.Tick
+}
+
 func (m model) resize(width, height int) model {
 	m.width, m.height = width, height
 
 	inputHeight := lipgloss.Height(m.inputView())
-	chrome := lipgloss.Height(renderHeader(m.llm.Model, m.storePath, width)) + inputHeight + 3
+	chrome := lipgloss.Height(m.headerView(width)) + inputHeight + 3
 
 	if !m.ready {
 		m.viewport = viewport.New(viewport.WithWidth(width), viewport.WithHeight(max(height-chrome, 3)))
@@ -263,7 +329,7 @@ func (m model) View() tea.View {
 	}
 
 	view := tea.NewView(lipgloss.JoinVertical(lipgloss.Left,
-		renderHeader(m.llm.Model, m.storePath, m.width),
+		m.headerView(m.width),
 		"",
 		m.viewport.View(),
 		"",
@@ -284,4 +350,13 @@ func (m model) helpView() string {
 		return helpStyle.Render(fmt.Sprintf("%s working · /cancel [why] or ctrl+c stops it", m.spinner.View()))
 	}
 	return helpStyle.Render(commandHelp() + " · enter send")
+}
+
+// headerView draws the bar, naming whatever tasks are still running.
+func (m model) headerView(width int) string {
+	var running []string
+	if m.transcript != nil {
+		running = m.transcript.runningTasks()
+	}
+	return renderHeader(m.llm.Model, running, width)
 }
