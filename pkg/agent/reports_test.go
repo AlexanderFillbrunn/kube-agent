@@ -20,20 +20,24 @@ type logStore struct {
 	next   int
 }
 
-func (s *logStore) Persist(_ context.Context, ev *events.Event) (*events.Event, error) {
+func (s *logStore) Persist(_ context.Context, evs ...*events.Event) ([]*events.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	stored := *ev
-	stored.Seq = s.next
-	if stored.ID == "" {
-		stored.ID = "ev-" + string(rune('a'+s.next))
+	stored := make([]*events.Event, 0, len(evs))
+	for _, ev := range evs {
+		one := *ev
+		one.Seq = s.next
+		if one.ID == "" {
+			one.ID = "ev-" + string(rune('a'+s.next))
+		}
+		if one.Timestamp.IsZero() {
+			one.Timestamp = time.Unix(int64(s.next), 0)
+		}
+		s.next++
+		s.events = append(s.events, &one)
+		stored = append(stored, &one)
 	}
-	if stored.Timestamp.IsZero() {
-		stored.Timestamp = time.Unix(int64(s.next), 0)
-	}
-	s.next++
-	s.events = append(s.events, &stored)
-	return &stored, nil
+	return stored, nil
 }
 
 // GetEventsForArc applies the projection's cutoff the way the real store does:

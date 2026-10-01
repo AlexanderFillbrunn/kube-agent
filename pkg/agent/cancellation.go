@@ -27,7 +27,8 @@ type CancelSource interface {
 // The guard sits on the write path because a dispatch is written immediately
 // before its tool runs, so a check there stops the tool rather than the run
 // that follows it. A refused write is reported as ErrCancelled and nothing is
-// written.
+// written. One event that starts work refuses the whole batch it arrived in,
+// since a batch is written whole or not at all.
 func GuardCancellation(persistor EventPersistor, cancels CancelSource) EventPersistor {
 	return &guardedPersistor{persistor: persistor, cancels: cancels}
 }
@@ -41,13 +42,13 @@ type guardedPersistor struct {
 	seen map[string]bool
 }
 
-func (g *guardedPersistor) Persist(ctx context.Context, ev *events.Event) (*events.Event, error) {
+func (g *guardedPersistor) Persist(ctx context.Context, evs ...*events.Event) ([]*events.Event, error) {
 	// Only a write that is about to start work is worth stopping. Refusing the
 	// rest would lose the record without preventing anything.
-	if !startsWork(ev) || ev.CorrelationID == nil {
-		return g.persistor.Persist(ctx, ev)
+	arcID, guarded := guardedArc(evs)
+	if !guarded {
+		return g.persistor.Persist(ctx, evs...)
 	}
-	arcID := *ev.CorrelationID
 
 	if g.seen[arcID] {
 		return nil, fmt.Errorf("%w: arc %s", ErrCancelled, arcID)
@@ -57,10 +58,10 @@ func (g *guardedPersistor) Persist(ctx context.Context, ev *events.Event) (*even
 	if err != nil {
 		// A guard that cannot answer lets the write through. The cancel is
 		// still in the log, and the run stops at the next step that can see it.
-		return g.persistor.Persist(ctx, ev)
+		return g.persistor.Persist(ctx, evs...)
 	}
 	if cancel == nil {
-		return g.persistor.Persist(ctx, ev)
+		return g.persistor.Persist(ctx, evs...)
 	}
 
 	if g.seen == nil {
@@ -68,7 +69,18 @@ func (g *guardedPersistor) Persist(ctx context.Context, ev *events.Event) (*even
 	}
 	g.seen[arcID] = true
 
-	return nil, fmt.Errorf("%w: arc %s, %s not written", ErrCancelled, arcID, ev.Typ)
+	return nil, fmt.Errorf("%w: arc %s, %d events not written", ErrCancelled, arcID, len(evs))
+}
+
+// guardedArc returns the arc a batch would start work on, and whether any
+// event in it does. One is enough, because the batch is refused whole.
+func guardedArc(evs []*events.Event) (string, bool) {
+	for _, ev := range evs {
+		if startsWork(ev) && ev.CorrelationID != nil {
+			return *ev.CorrelationID, true
+		}
+	}
+	return "", false
 }
 
 // startsWork reports whether an event is written before something happens

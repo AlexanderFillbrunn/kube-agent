@@ -22,18 +22,22 @@ type fakePersistor struct {
 	persisted []*events.Event
 }
 
-func (p *fakePersistor) Persist(_ context.Context, ev *events.Event) (*events.Event, error) {
-	stored := *ev
-	stored.Seq = p.next
-	if stored.ID == "" {
-		stored.ID = fmt.Sprintf("ev-%d", p.next)
+func (p *fakePersistor) Persist(_ context.Context, evs ...*events.Event) ([]*events.Event, error) {
+	stored := make([]*events.Event, 0, len(evs))
+	for _, ev := range evs {
+		one := *ev
+		one.Seq = p.next
+		if one.ID == "" {
+			one.ID = fmt.Sprintf("ev-%d", p.next)
+		}
+		if one.Timestamp.IsZero() {
+			one.Timestamp = time.Unix(int64(p.next), 0)
+		}
+		p.next++
+		p.persisted = append(p.persisted, &one)
+		stored = append(stored, &one)
 	}
-	if stored.Timestamp.IsZero() {
-		stored.Timestamp = time.Unix(int64(p.next), 0)
-	}
-	p.next++
-	p.persisted = append(p.persisted, &stored)
-	return &stored, nil
+	return stored, nil
 }
 
 // A tool call names the message that requested it, and that name is the ID the
@@ -383,7 +387,7 @@ type brokenPersistor struct {
 	fakePersistor
 }
 
-func (p *brokenPersistor) Persist(context.Context, *events.Event) (*events.Event, error) {
+func (p *brokenPersistor) Persist(context.Context, ...*events.Event) ([]*events.Event, error) {
 	return nil, errors.New("the log is full")
 }
 
@@ -418,6 +422,152 @@ func TestAHandlerThatReturnsUnderCancellationIsStillRecorded(t *testing.T) {
 	call := h.Arcs[0].Responses[0].ToolCalls[0]
 	if call.Status != history.ToolCallStatusFailed {
 		t.Errorf("the call is %s, want it settled as failed", call.Status)
+	}
+}
+
+// contextPersistor refuses a write on a cancelled context, the way a store that
+// honours the context it is handed does and fakePersistor does not.
+type contextPersistor struct {
+	fakePersistor
+}
+
+func (p *contextPersistor) Persist(ctx context.Context, evs ...*events.Event) ([]*events.Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return p.fakePersistor.Persist(ctx, evs...)
+}
+
+// The record of what a tool did outlives the context it ran under. Written on
+// the run's own context, the one write that says what happened is the write a
+// store refuses.
+func TestAToolResultIsWrittenAfterTheContextIsCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	registry := registryWith(t, "restart_deployment", func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		cancel()
+		return nil, errors.New("the API call was interrupted")
+	})
+
+	persistor := &contextPersistor{fakePersistor: fakePersistor{next: 1}}
+	agent, err := NewAgent(nil, registry, &scriptedLLM{replies: []*LLMResponse{
+		{ModelID: "gpt-5", ToolCalls: []LLMToolCall{{VendorID: "call_abc", ToolName: "restart_deployment"}}},
+	}})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+
+	h := userArcHistory(t)
+	if err := agent.Run(ctx, persistor, h, testArcID); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v, want the cancellation", err)
+	}
+
+	want := "ASSISTANT_MESSAGE, TOOL_CALL, TOOL_DISPATCHED, TOOL_RESULT"
+	if got := typesOf(persistor.persisted); got != want {
+		t.Fatalf("wrote %s, want %s", got, want)
+	}
+}
+
+// batchPersistor remembers how the agent grouped its writes.
+type batchPersistor struct {
+	fakePersistor
+	batches [][]*events.Event
+}
+
+func (p *batchPersistor) Persist(ctx context.Context, evs ...*events.Event) ([]*events.Event, error) {
+	p.batches = append(p.batches, evs)
+	return p.fakePersistor.Persist(ctx, evs...)
+}
+
+// A reply and the calls it requested reach the log as one write. Written
+// separately, a failure between them leaves a message with no calls, which the
+// next run reads as an answer and closes the arc on.
+func TestAReplyAndItsCallsAreOneWrite(t *testing.T) {
+	persistor := &batchPersistor{fakePersistor: fakePersistor{next: 1}}
+	agent, err := NewAgent(nil, nil, &scriptedLLM{})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	h := userArcHistory(t)
+	state := &agentState{
+		history:   h,
+		arc:       h.Arcs[0],
+		foldState: history.FoldStateFromHistory(h),
+		persistor: persistor,
+	}
+
+	response := &LLMResponse{ModelID: "gpt-5", Content: "restarting", ToolCalls: []LLMToolCall{
+		{VendorID: "call_a", ToolName: "restart_deployment"},
+		{VendorID: "call_b", ToolName: "list_pods"},
+	}}
+	if err := agent.recordResponse(context.Background(), response, state); err != nil {
+		t.Fatalf("recordResponse: %v", err)
+	}
+
+	if len(persistor.batches) != 1 {
+		t.Fatalf("the reply took %d writes, want one", len(persistor.batches))
+	}
+	if got := typesOf(persistor.batches[0]); got != "ASSISTANT_MESSAGE, TOOL_CALL, TOOL_CALL" {
+		t.Fatalf("the write held %s", got)
+	}
+
+	// The calls name the message although nothing had been written when they
+	// were built.
+	message := persistor.batches[0][0]
+	for _, call := range persistor.batches[0][1:] {
+		if got := call.Payload.(events.ToolCallPayload).MessageID; got != message.ID {
+			t.Errorf("call names message %q, want %q", got, message.ID)
+		}
+	}
+}
+
+// cancellingLLM answers and then cancels the run, which is the window between
+// the model having spoken and the log having heard it.
+type cancellingLLM struct {
+	reply  *LLMResponse
+	cancel context.CancelFunc
+}
+
+func (l *cancellingLLM) StreamResponse(_ context.Context, _ *history.History, _ *LLMOptions, _ Sink[string]) (*LLMResponse, error) {
+	l.cancel()
+	return l.reply, nil
+}
+
+func (l *cancellingLLM) Response(context.Context, *history.History, *LLMOptions) (*LLMResponse, error) {
+	l.cancel()
+	return l.reply, nil
+}
+
+// A reply and the calls it requested are one record written twice. A cancel
+// landing between them would leave a reply the arc reads as a final answer,
+// with the calls it asked for missing. The dispatch that would have followed
+// is refused, because that one starts work.
+func TestAReplyKeepsItsCallsWhenTheRunIsCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	llm := &cancellingLLM{cancel: cancel, reply: &LLMResponse{
+		ModelID:   "gpt-5",
+		Content:   "restarting",
+		ToolCalls: []LLMToolCall{{VendorID: "call_abc", ToolName: "restart_deployment"}},
+	}}
+
+	registry := registryWith(t, "restart_deployment", func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		t.Error("the tool ran although the run was cancelled before it was dispatched")
+		return nil, nil
+	})
+
+	persistor := &contextPersistor{fakePersistor: fakePersistor{next: 1}}
+	agent, err := NewAgent(nil, registry, llm)
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+
+	h := userArcHistory(t)
+	if err := agent.Run(ctx, persistor, h, testArcID); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v, want the cancellation", err)
+	}
+
+	want := "ASSISTANT_MESSAGE, TOOL_CALL"
+	if got := typesOf(persistor.persisted); got != want {
+		t.Fatalf("wrote %s, want %s", got, want)
 	}
 }
 

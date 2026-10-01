@@ -29,6 +29,9 @@ A person's turn is not special. Nothing about somebody speaking makes it safe
 to run beside a task report on the same arc, so `session.turn` acquires the
 lease like everything else.
 
+`Work` is also where a run is given the context it can be stopped through. See
+[CANCELLATION.md](CANCELLATION.md).
+
 The invariant
 --------------------
 *Every write that changes what an arc has to do must be followed by a run of
@@ -46,6 +49,11 @@ the last one does anything.
 This produces runs that do nothing, and that is the design working. Each one
 costs a replay. A single lost trigger strands the arc, with the last run that
 ended returning nil to say it finished.
+
+A cancel is not an exception. It takes agent work away from an arc, but
+stopping the arc's async tasks is work a worker has to be given the arc to do,
+so it is written and enqueued like anything else. What a cancel reaches, and
+what it cannot, is [CANCELLATION.md](CANCELLATION.md).
 
 The queue
 --------------------

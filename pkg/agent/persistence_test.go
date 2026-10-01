@@ -15,7 +15,7 @@ func TestStampIdentityFilesEventsUnderItsSession(t *testing.T) {
 	persistor := StampIdentity(store, "session")
 
 	arcID := testArcID
-	stored, err := persistor.Persist(context.Background(), &events.Event{
+	written, err := persistor.Persist(context.Background(), &events.Event{
 		Typ:           events.UserMessageEventType,
 		CorrelationID: &arcID,
 		Payload:       events.UserMessagePayload{Content: "what is running?"},
@@ -23,6 +23,7 @@ func TestStampIdentityFilesEventsUnderItsSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Persist: %v", err)
 	}
+	stored := written[0]
 	if stored.SessionID != "session" {
 		t.Errorf("stored under session %q, want %q", stored.SessionID, "session")
 	}
@@ -38,20 +39,22 @@ func TestStampIdentityMintsAnIDAndATime(t *testing.T) {
 	persistor := StampIdentity(store, "session")
 
 	before := time.Now().UTC()
-	first, err := persistor.Persist(context.Background(), &events.Event{
+	writtenFirst, err := persistor.Persist(context.Background(), &events.Event{
 		Typ:     events.UserMessageEventType,
 		Payload: events.UserMessagePayload{Content: "what is running?"},
 	})
 	if err != nil {
 		t.Fatalf("Persist: %v", err)
 	}
-	second, err := persistor.Persist(context.Background(), &events.Event{
+	first := writtenFirst[0]
+	writtenSecond, err := persistor.Persist(context.Background(), &events.Event{
 		Typ:     events.UserMessageEventType,
 		Payload: events.UserMessagePayload{Content: "and now?"},
 	})
 	if err != nil {
 		t.Fatalf("Persist: %v", err)
 	}
+	second := writtenSecond[0]
 
 	if first.ID == "" || first.ID == second.ID {
 		t.Errorf("minted IDs %q and %q, want two distinct ones", first.ID, second.ID)
@@ -68,7 +71,7 @@ func TestStampIdentityKeepsWhatTheCallerSet(t *testing.T) {
 	persistor := StampIdentity(&fakePersistor{}, "session")
 
 	at := time.Unix(1000, 0).UTC()
-	stored, err := persistor.Persist(context.Background(), &events.Event{
+	written, err := persistor.Persist(context.Background(), &events.Event{
 		Typ:       events.UserMessageEventType,
 		ID:        "chosen-id",
 		Timestamp: at,
@@ -77,6 +80,7 @@ func TestStampIdentityKeepsWhatTheCallerSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Persist: %v", err)
 	}
+	stored := written[0]
 	if stored.ID != "chosen-id" || !stored.Timestamp.Equal(at) {
 		t.Errorf("stored as %q at %v, want the caller's id and time", stored.ID, stored.Timestamp)
 	}

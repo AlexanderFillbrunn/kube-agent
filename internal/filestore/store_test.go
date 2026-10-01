@@ -44,10 +44,11 @@ func assistantMessage(arcID, content string) *events.Event {
 func TestPersistAssignsIdentityFromZero(t *testing.T) {
 	store := openTemp(t)
 
-	first, err := store.Persist(context.Background(), userMessage("arc-1", "hello"))
+	writtenFirst, err := store.Persist(context.Background(), userMessage("arc-1", "hello"))
 	if err != nil {
 		t.Fatalf("Persist: %v", err)
 	}
+	first := writtenFirst[0]
 	if first.Seq != 0 {
 		t.Errorf("first event is seq %d, want 0", first.Seq)
 	}
@@ -55,10 +56,11 @@ func TestPersistAssignsIdentityFromZero(t *testing.T) {
 		t.Errorf("event stored without an identity: %+v", first)
 	}
 
-	second, err := store.Persist(context.Background(), assistantMessage("arc-1", "hi"))
+	writtenSecond, err := store.Persist(context.Background(), assistantMessage("arc-1", "hi"))
 	if err != nil {
 		t.Fatalf("Persist: %v", err)
 	}
+	second := writtenSecond[0]
 	if second.Seq != 1 {
 		t.Errorf("second event is seq %d, want 1", second.Seq)
 	}
@@ -88,10 +90,11 @@ func TestOpenResumesTheSequence(t *testing.T) {
 	}
 	defer second.Close()
 
-	next, err := second.Persist(context.Background(), userMessage("arc-2", "still there?"))
+	written, err := second.Persist(context.Background(), userMessage("arc-2", "still there?"))
 	if err != nil {
 		t.Fatalf("Persist: %v", err)
 	}
+	next := written[0]
 	if next.Seq != 2 {
 		t.Errorf("resumed at seq %d, want 2", next.Seq)
 	}

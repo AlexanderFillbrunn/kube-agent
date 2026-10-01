@@ -51,13 +51,14 @@ func TestClearStartsANewLogAndKeepsTheOld(t *testing.T) {
 
 	// The next event starts the numbering over, which is what the fold of a
 	// fresh history expects.
-	next, err := store.Persist(context.Background(), &events.Event{
+	written, err := store.Persist(context.Background(), &events.Event{
 		SessionID: "session", Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
 		Payload: events.UserMessagePayload{Content: "again", Actor: actor},
 	})
 	if err != nil {
 		t.Fatalf("Persist: %v", err)
 	}
+	next := written[0]
 	if next.Seq != 0 {
 		t.Errorf("the new log starts at seq %d, want 0", next.Seq)
 	}

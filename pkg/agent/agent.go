@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 
 	"fillbrunn.ai/kube-agent/pkg/events"
 	"fillbrunn.ai/kube-agent/pkg/history"
@@ -161,8 +162,7 @@ func (a Agent) recordFailure(ctx context.Context, cause error, state *agentState
 		Payload:       events.ErrorPayload{Message: cause.Error(), IsFatal: true},
 	}
 
-	// A cancelled context would refuse the write that records the failure.
-	if _, err := a.persistAndFold(context.WithoutCancel(ctx), failure, state); err != nil {
+	if _, err := a.persistAndFold(ctx, state, failure); err != nil {
 		// Neither the cause nor the failure to record it is worth losing.
 		return errors.Join(cause, err)
 	}
@@ -209,34 +209,56 @@ func (a Agent) closeArc(ctx context.Context, state *agentState) error {
 	}
 	last := state.arc.Responses[len(state.arc.Responses)-1]
 
-	_, err := a.persistAndFold(ctx, &events.Event{
+	_, err := a.persistAndFold(ctx, state, &events.Event{
 		Typ: events.ArcClosedEventType,
 		CorrelationID: &state.arc.ID,
 		Payload: events.ArcClosedPayload{CausationID: last.ID},
-	}, state)
+	})
 	return err
 }
 
 // persistAndFold writes one event and folds it into the history, returning the
-// event as it was persisted. The persistor assigns the ID, sequence number and
-// timestamp, so a caller naming this event later reads them from what comes
-// back.
-func (a Agent) persistAndFold(ctx context.Context, ev *events.Event, state *agentState) (*events.Event, error) {
-	newEv, err := state.persistor.Persist(ctx, ev)
+// events as they were persisted. The persistor assigns the sequence number,
+// and the ID and timestamp where the caller left them empty, so a caller
+// naming one of these events later reads it from what comes back.
+//
+// Events passed together are written together or not at all, which is what
+// keeps two events that say one thing from becoming one event that says
+// something else.
+func (a Agent) persistAndFold(ctx context.Context, state *agentState, evs ...*events.Event) ([]*events.Event, error) {
+	// A write that starts work honours the cancel, because not starting it is
+	// the point. Every other write records something that already happened,
+	// and losing one leaves the log saying less than the agent did. One event
+	// that starts work governs its whole batch, as it does for the guard.
+	if _, starts := guardedArc(evs); !starts {
+		ctx = context.WithoutCancel(ctx)
+	}
+	stored, err := state.persistor.Persist(ctx, evs...)
 	if err != nil {
-		return nil, fmt.Errorf("error persisting %s event: %w", ev.Typ, err)
+		return nil, fmt.Errorf("error persisting %s: %w", eventTypes(evs), err)
 	}
-	if err := state.history.Update(newEv, state.foldState); err != nil {
-		return nil, fmt.Errorf("error folding %s event: %w", newEv.Typ, err)
-	}
-	// The observer is told after the fold, so it sees the history the next
-	// step reads.
-	if a.config.Observer != nil {
-		if err := a.config.Observer.Consume(newEv); err != nil {
-			return nil, fmt.Errorf("error observing %s event: %w", newEv.Typ, err)
+	for _, ev := range stored {
+		if err := state.history.Update(ev, state.foldState); err != nil {
+			return nil, fmt.Errorf("error folding %s event: %w", ev.Typ, err)
+		}
+		// The observer is told after the fold, so it sees the history the next
+		// step reads.
+		if a.config.Observer != nil {
+			if err := a.config.Observer.Consume(ev); err != nil {
+				return nil, fmt.Errorf("error observing %s event: %w", ev.Typ, err)
+			}
 		}
 	}
-	return newEv, nil
+	return stored, nil
+}
+
+// eventTypes names a batch for an error message.
+func eventTypes(evs []*events.Event) string {
+	names := make([]string, 0, len(evs))
+	for _, ev := range evs {
+		names = append(names, string(ev.Typ))
+	}
+	return strings.Join(names, ", ")
 }
 
 // llmStep calls the LLM with the history so far and records what it replied.
@@ -256,11 +278,19 @@ func (a Agent) llmStep(ctx context.Context, state *agentState) error {
 	return a.recordResponse(ctx, response, state)
 }
 
-// recordResponse writes a reply to the log: the message first, then one event
-// per call it requested, each naming the message the persistor just gave an ID
-// to.
+// recordResponse writes a reply to the log: the message and one event per call
+// it requested, in one write.
+//
+// They go together because a log holding the message alone reads as an answer
+// the model never gave, and the next run closes the arc on it. The message ID
+// is minted here rather than read back, since the calls have to name it before
+// any of them is written.
 func (a Agent) recordResponse(ctx context.Context, response *LLMResponse, state *agentState) error {
-	message, err := a.persistAndFold(ctx, &events.Event{
+	messageID := NewEventID()
+
+	batch := make([]*events.Event, 0, len(response.ToolCalls)+1)
+	batch = append(batch, &events.Event{
+		ID:            messageID,
 		Typ:           events.AssistantMessageEventType,
 		CorrelationID: &state.arc.ID,
 		Payload: events.AssistantMessagePayload{
@@ -270,15 +300,22 @@ func (a Agent) recordResponse(ctx context.Context, response *LLMResponse, state 
 			Reasoning: response.Reasoning,
 			Usage:     recordedUsage(response.Usage),
 		},
-	}, state)
-	if err != nil {
-		return err
+	})
+	for _, call := range response.ToolCalls {
+		batch = append(batch, &events.Event{
+			Typ:           events.ToolCallEventType,
+			CorrelationID: &state.arc.ID,
+			Payload: events.ToolCallPayload{
+				MessageID: messageID,
+				VendorID:  call.VendorID,
+				ToolName:  call.ToolName,
+				Args:      call.Args,
+			},
+		})
 	}
 
-	if err := a.recordToolCalls(ctx, response.ToolCalls, message.ID, state); err != nil {
-		return err
-	}
-	return nil
+	_, err := a.persistAndFold(ctx, state, batch...)
+	return err
 }
 
 // recordedUsage carries a reply's cost into the record of it. Nothing is
@@ -293,26 +330,6 @@ func recordedUsage(usage *TokenUsage) *events.TokenUsage {
 		CachedInput: usage.CachedInput,
 		Output:      usage.Output,
 	}
-}
-
-// recordToolCalls writes the calls one message requested, each naming it.
-func (a Agent) recordToolCalls(ctx context.Context, calls []LLMToolCall, messageID string, state *agentState) error {
-	for _, call := range calls {
-		_, err := a.persistAndFold(ctx, &events.Event{
-			Typ:           events.ToolCallEventType,
-			CorrelationID: &state.arc.ID,
-			Payload: events.ToolCallPayload{
-				MessageID: messageID,
-				VendorID:  call.VendorID,
-				ToolName:  call.ToolName,
-				Args:      call.Args,
-			},
-		}, state)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // toolStep runs every call the arc is still waiting on, in the order they were
@@ -490,27 +507,33 @@ func (a Agent) knows(name string) bool {
 
 // startTask records a task, starts it, and answers the call that asked for it.
 //
-// The invocation is written before the task starts, because the record is what
-// names the task: the persistor assigns the ID the task reports back under.
+// The dispatch and the invocation are written before the task starts, in one
+// write, because the record is what names the task. The invocation ID is
+// minted here so the task can be started under it.
 func (a Agent) startTask(ctx context.Context, call *history.ToolCall, state *agentState) error {
 	definition, ok := a.tasks.Get(call.ToolName)
 	if !ok {
 		return fmt.Errorf("task not registered: %s", call.ToolName)
 	}
-	if err := a.recordDispatch(ctx, call, state); err != nil {
+
+	invocationID := NewEventID()
+	if _, err := a.persistAndFold(ctx, state,
+		&events.Event{
+			Typ:           events.ToolDispatchedEventType,
+			CorrelationID: &state.arc.ID,
+			Payload:       events.ToolDispatchedPayload{CausationID: call.ID},
+		},
+		&events.Event{
+			ID:            invocationID,
+			Typ:           events.AsyncTaskInvokeEventType,
+			CorrelationID: &state.arc.ID,
+			Payload:       events.AsyncTaskInvokePayload{TaskName: call.ToolName, Args: call.Args},
+		},
+	); err != nil {
 		return err
 	}
 
-	invocation, err := a.persistAndFold(ctx, &events.Event{
-		Typ:           events.AsyncTaskInvokeEventType,
-		CorrelationID: &state.arc.ID,
-		Payload:       events.AsyncTaskInvokePayload{TaskName: call.ToolName, Args: call.Args},
-	}, state)
-	if err != nil {
-		return err
-	}
-
-	ref := TaskRef{ArcID: state.arc.ID, ID: invocation.ID, Name: call.ToolName}
+	ref := TaskRef{ArcID: state.arc.ID, ID: invocationID, Name: call.ToolName}
 	if err := definition.Start(ctx, ref, call.Args); err != nil {
 		return a.settleUnstartedTask(ctx, call, ref, err, state)
 	}
@@ -529,7 +552,7 @@ func (a Agent) settleUnstartedTask(ctx context.Context, call *history.ToolCall, 
 		"task %s could not be started: %s. Whether it took hold before the failure is not known, "+
 			"so check before starting it again.", ref.Name, cause)
 
-	if _, err := a.persistAndFold(ctx, &events.Event{
+	if _, err := a.persistAndFold(ctx, state, &events.Event{
 		Typ:           events.AsyncTaskResultEventType,
 		CorrelationID: &state.arc.ID,
 		Payload: events.AsyncTaskResultPayload{
@@ -537,7 +560,7 @@ func (a Agent) settleUnstartedTask(ctx context.Context, call *history.ToolCall, 
 			Result:      reason,
 			Outcome:     events.AsyncTaskOutcomeFailed,
 		},
-	}, state); err != nil {
+	}); err != nil {
 		return err
 	}
 	return a.settleCall(ctx, call, ToolOutcome{Result: reason, IsError: true}, state)
@@ -603,11 +626,11 @@ func (a Agent) provideTaskInput(ctx context.Context, call *history.ToolCall, sta
 	// The record belongs to the arc that owns the task, so the arc waiting on
 	// this answer is the one that reads it. It is the only event the agent
 	// writes outside the arc it is working on.
-	if _, err := a.persistAndFold(ctx, &events.Event{
+	if _, err := a.persistAndFold(ctx, state, &events.Event{
 		Typ:           events.AsyncTaskInputProvidedEventType,
 		CorrelationID: &task.CorrelationID,
 		Payload:       events.AsyncTaskInputProvidedPayload{CausationID: task.ID, Message: input},
-	}, state); err != nil {
+	}); err != nil {
 		return err
 	}
 
@@ -636,17 +659,17 @@ func (a Agent) addressedTask(call *history.ToolCall, state *agentState) (*histor
 // recordDispatch says that a call was handed to whatever answers it, before
 // the work starts.
 func (a Agent) recordDispatch(ctx context.Context, call *history.ToolCall, state *agentState) error {
-	_, err := a.persistAndFold(ctx, &events.Event{
+	_, err := a.persistAndFold(ctx, state, &events.Event{
 		Typ:           events.ToolDispatchedEventType,
 		CorrelationID: &state.arc.ID,
 		Payload:       events.ToolDispatchedPayload{CausationID: call.ID},
-	}, state)
+	})
 	return err
 }
 
 // settleCall answers one call with what came of it.
 func (a Agent) settleCall(ctx context.Context, call *history.ToolCall, outcome ToolOutcome, state *agentState) error {
-	_, err := a.persistAndFold(ctx, &events.Event{
+	_, err := a.persistAndFold(ctx, state, &events.Event{
 		Typ:           events.ToolResultEventType,
 		CorrelationID: &state.arc.ID,
 		Payload: events.ToolResultPayload{
@@ -654,7 +677,7 @@ func (a Agent) settleCall(ctx context.Context, call *history.ToolCall, outcome T
 			Result:      outcome.Result,
 			IsError:     outcome.IsError,
 		},
-	}, state)
+	})
 	return err
 }
 

@@ -102,40 +102,58 @@ func (s *Store) Close() error {
 	return s.file.Close()
 }
 
-// Persist writes one event and returns it as it was stored. The sequence
+// Persist writes events and returns them as they were stored. The sequence
 // number is the store's to assign, since nothing outside the lock knows the
 // position in the log.
 //
 // An ID and a timestamp are filled in only where the caller left them empty,
 // which a caller writing through agent.StampIdentity never does.
-func (s *Store) Persist(_ context.Context, ev *events.Event) (*events.Event, error) {
+//
+// A batch is one write and one sync, and the sequence number only advances
+// once it is on disk. That is as close to atomic as a file gets: a write that
+// fails part way still leaves a torn line that readFile refuses, which is the
+// kind of thing this store is allowed to do and a real one is not.
+func (s *Store) Persist(_ context.Context, evs ...*events.Event) ([]*events.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	stored := *ev
-	s.seq++
-	stored.Seq = s.seq
-	if stored.ID == "" {
-		stored.ID = NewID()
-	}
-	if stored.Timestamp.IsZero() {
-		stored.Timestamp = time.Now().UTC()
+	if len(evs) == 0 {
+		return nil, nil
 	}
 
-	line, err := json.Marshal(&stored)
-	if err != nil {
-		return nil, fmt.Errorf("marshal %s event: %w", stored.Typ, err)
+	seq := s.seq
+	stored := make([]*events.Event, 0, len(evs))
+	var lines []byte
+	for _, ev := range evs {
+		one := *ev
+		seq++
+		one.Seq = seq
+		if one.ID == "" {
+			one.ID = NewID()
+		}
+		if one.Timestamp.IsZero() {
+			one.Timestamp = time.Now().UTC()
+		}
+
+		line, err := json.Marshal(&one)
+		if err != nil {
+			return nil, fmt.Errorf("marshal %s event: %w", one.Typ, err)
+		}
+		lines = append(append(lines, line...), '\n')
+		stored = append(stored, &one)
 	}
-	if _, err := s.file.Write(append(line, '\n')); err != nil {
+
+	if _, err := s.file.Write(lines); err != nil {
 		return nil, fmt.Errorf("append to %s: %w", s.path, err)
 	}
 	// A crash between the write and the next step is exactly the case the
-	// dispatch record exists for, so the line is on disk before the caller
-	// acts on it.
+	// dispatch record exists for, so the lines are on disk before the caller
+	// acts on them.
 	if err := s.file.Sync(); err != nil {
 		return nil, fmt.Errorf("sync %s: %w", s.path, err)
 	}
-	return &stored, nil
+	s.seq = seq
+	return stored, nil
 }
 
 // Events returns the whole log in the order it was written.

@@ -28,7 +28,10 @@ func SinkFromFunc[E any](f func(i E) error) Sink[E] {
 }
 
 type EventPersistor interface {
-	Persist(ctx context.Context, e *events.Event) (*events.Event, error)
+	// Persist appends the events in the order given, all of them or none. A
+	// caller that writes two events to say one thing must not have one of
+	// them survive without the other.
+	Persist(ctx context.Context, evs ...*events.Event) ([]*events.Event, error)
 }
 
 type EventSource interface {
@@ -50,19 +53,23 @@ type stampingPersistor struct {
 	sessionID string
 }
 
-func (s *stampingPersistor) Persist(ctx context.Context, ev *events.Event) (*events.Event, error) {
-	// The caller's event is left alone, since they may still be holding it.
-	stamped := *ev
-	stamped.SessionID = s.sessionID
-	// An ID or a time already set is kept, which is how a caller ties two
-	// events together before either is written. Uniqueness is not checked.
-	if stamped.ID == "" {
-		stamped.ID = NewEventID()
+func (s *stampingPersistor) Persist(ctx context.Context, evs ...*events.Event) ([]*events.Event, error) {
+	stamped := make([]*events.Event, 0, len(evs))
+	for _, ev := range evs {
+		// The caller's event is left alone, since they may still be holding it.
+		one := *ev
+		one.SessionID = s.sessionID
+		// An ID or a time already set is kept, which is how a caller ties two
+		// events together before either is written. Uniqueness is not checked.
+		if one.ID == "" {
+			one.ID = NewEventID()
+		}
+		if one.Timestamp.IsZero() {
+			one.Timestamp = time.Now().UTC()
+		}
+		stamped = append(stamped, &one)
 	}
-	if stamped.Timestamp.IsZero() {
-		stamped.Timestamp = time.Now().UTC()
-	}
-	return s.persistor.Persist(ctx, &stamped)
+	return s.persistor.Persist(ctx, stamped...)
 }
 
 // NewEventID mints an identifier for an event.

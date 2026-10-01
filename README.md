@@ -21,10 +21,12 @@ The rest are proposals rather than specifications:
     docs/COMPACTION.md   how a session continues past the size of a context window
     docs/INTERRUPTS.md   how a tool call is put to a human
     docs/RE-ENTRY.md     how an arc that already exists is worked again
+    docs/CANCELLATION.md what stopping an arc reaches, and what it does not
 
-The code follows none of them in full. Two are half built: the log and the
-projection carry interrupts already but nothing raises one, and an arc is
-re-entered under a lease but no queue drives it.
+The code follows none of them in full, and several are partly built: the log
+and the projection carry interrupts already but nothing raises one, an arc is
+re-entered under a lease but no queue drives it, and a cancel is recorded and
+guarded but reaches nothing already under way.
 
 Development harness
 --------------------
