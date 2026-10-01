@@ -12,13 +12,19 @@ derived from that fold rather than kept alongside it.
 Two documents specify the transitions between the log and a provider's request,
 and the code follows them rather than the other way round:
 
-    PROJECTION.md   what the model is told
-    ENCODING.md     how it is carried
+    docs/PROJECTION.md   what the model is told
+    docs/ENCODING.md     how it is carried
 
-A third is a proposal rather than a specification, and the code does not follow
-it:
+The rest are proposals rather than specifications:
 
-    ASYNC-TASKS.md  whether a task belongs to an arc or stands beside one
+    docs/ASYNC-TASKS.md  whether a task belongs to an arc or stands beside one
+    docs/COMPACTION.md   how a session continues past the size of a context window
+    docs/INTERRUPTS.md   how a tool call is put to a human
+    docs/RE-ENTRY.md     how an arc that already exists is worked again
+
+The code follows none of them in full. Two are half built: the log and the
+projection carry interrupts already but nothing raises one, and an arc is
+re-entered under a lease but no queue drives it.
 
 Development harness
 --------------------

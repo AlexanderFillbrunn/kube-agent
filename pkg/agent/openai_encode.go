@@ -12,14 +12,12 @@ import (
 // This file is the OpenAI half of the encoding step ENCODING.md specifies: it
 // turns a ModelTranscript into the messages and tools of a Chat Completions
 // request. It decides how the transcript is carried, never what the model is
-// told; anything it would have to invent belongs to the projection.
+// told.
 //
+// Three of the four repairs ENCODING.md lists are unreachable here, since
 // OpenAI accepts adjacent same-role messages and constrains neither the first
-// nor the last role, so three of the four repairs the document lists are not
-// reachable here. Merging is the one that would still be worth doing for the
-// model's sake, and it needs the actor behind each user message to write the
-// headers with. A ModelTextMessage does not carry one, so merging waits for a
-// transcript that does rather than being faked from position.
+// nor the last role. Merging is not done: it needs the actor behind each user
+// message, which a ModelTextMessage does not carry.
 
 const (
 	openAIRoleSystem    = "system"
@@ -31,7 +29,7 @@ const (
 
 // openAIMessage is one entry of the request's `messages` array. Content is a
 // pointer because an assistant message that only requests calls has no content
-// at all, which is a different thing to the empty string.
+// at all, which is not the empty string.
 type openAIMessage struct {
 	Role       string           `json:"role"`
 	Content    *string          `json:"content,omitempty"`
@@ -66,19 +64,17 @@ type openAIFunction struct {
 // encoder holds the per-request state of one encoding.
 type encoder struct {
 	// vendorIDs maps a tool call's log ID to the identifier the provider
-	// issued for it. A call the model made under one ID and is shown back
-	// under another is a call it cannot match to its own request.
+	// issued for it.
 	vendorIDs map[string]string
 
-	// noteRole is where a note is carried. Every note in one request goes
-	// through the same carrier, so role stays a stable signal of provenance.
+	// noteRole is where a note is carried. Every note in one request uses the
+	// same role, so the role is a stable signal of provenance.
 	noteRole string
 }
 
 // encodeTranscript renders a transcript as the messages of one request. The
-// system prompt is prepended as the real instruction it is; notes never go
-// there, because an instruction sits in the cached prefix for the session and
-// a note belongs at the position it was raised.
+// system prompt is prepended. Notes are not, since a note belongs at the
+// position it was raised.
 func (e encoder) encodeTranscript(transcript *history.ModelTranscript, systemPrompt string) ([]openAIMessage, error) {
 	messages := make([]openAIMessage, 0, len(transcript.Messages)+1)
 	if systemPrompt != "" {
@@ -143,9 +139,8 @@ func (e encoder) encodeAssistant(message history.ModelAssistantMessage) ([]openA
 }
 
 // toolCallID returns the identifier a call travels under. A call the provider
-// issued keeps the provider's own ID; a stand-in the projection synthesized
-// never had one, so it gets an ID derived from its log ID, which is stable
-// across the requests that replay it.
+// issued keeps the provider's own ID. A stand-in the projection synthesized
+// never had one, so it gets an ID derived from its log ID.
 func (e encoder) toolCallID(logID string) string {
 	if vendorID, ok := e.vendorIDs[logID]; ok && vendorID != "" {
 		return vendorID
@@ -175,11 +170,11 @@ func vendorToolCallIDs(h *history.History) map[string]string {
 }
 
 // encodeTools renders the registry as the request's tool list.
-func encodeTools(registry *ToolRegistry) []openAITool {
-	if registry == nil {
+func encodeTools(set ToolSet) []openAITool {
+	if set == nil {
 		return nil
 	}
-	tools := registry.All()
+	tools := set.All()
 	encoded := make([]openAITool, 0, len(tools))
 	for _, tool := range tools {
 		encoded = append(encoded, openAITool{

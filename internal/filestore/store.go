@@ -1,14 +1,11 @@
 // Package filestore keeps an event log in a single file, so the agent can be
 // exercised end to end without standing anything up.
 //
-// It is a development and test store, and it is under internal/ so that it
-// cannot become anything else. It holds the whole log in memory on every read,
-// scans the file for every query, never compacts, serializes everything behind
-// one mutex, and assumes it is the only writer. A real store would index by
-// arc, stream rather than slurp, and survive two workers; this one does none
-// of that and is not a starting point for one.
+// It is a development and test store, under internal/ so that it cannot become
+// anything else. It holds the whole log in memory on every read, scans the file
+// for every query, never compacts, and assumes it is the only writer.
 //
-// What it does hold to is the contract the projection depends on: see
+// What it does hold to is the contract the projection depends on. See
 // GetEventsForArc.
 package filestore
 
@@ -68,12 +65,8 @@ func Open(path string) (*Store, error) {
 }
 
 // Rotate moves the log aside and starts an empty one in its place, returning
-// the path the old one was moved to, or "" where there was nothing to move.
-//
-// It is how a session starts over. The log is renamed rather than truncated,
-// because a record that has been read and acted on is not something to delete
-// for the sake of a clean screen, and a harness is exactly where you want the
-// run you just made sense of still on disk.
+// the path the old one was moved to, or "" where there was nothing to move. The
+// log is renamed rather than truncated, so the old session stays on disk.
 func (s *Store) Rotate() (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -109,13 +102,12 @@ func (s *Store) Close() error {
 	return s.file.Close()
 }
 
-// Persist writes one event and returns it as it was stored.
+// Persist writes one event and returns it as it was stored. The sequence
+// number is the store's to assign, since nothing outside the lock knows the
+// position in the log.
 //
-// The sequence number is the store's to assign, since it is the position in
-// this log and nothing outside the lock can know it. An ID and a timestamp are
-// filled in only where the caller left them empty, which a caller writing
-// through agent.StampIdentity never does; the fallback is here so that a test
-// writing straight to the store still produces a readable log.
+// An ID and a timestamp are filled in only where the caller left them empty,
+// which a caller writing through agent.StampIdentity never does.
 func (s *Store) Persist(_ context.Context, ev *events.Event) (*events.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -157,9 +149,8 @@ func (s *Store) Events(_ context.Context) ([]*events.Event, error) {
 // to and including the user message that opened it, plus everything correlated
 // to it afterwards.
 //
-// That query is the projection's cutoff, so it is the one thing in this
-// package that is not a shortcut. A store that returned more, or less, would
-// quietly change what the model is told. See PROJECTION.md.
+// That query is the projection's cutoff. A store that returned more, or less,
+// would change what the model is told. See PROJECTION.md.
 func (s *Store) GetEventsForArc(_ context.Context, arcID string) ([]*events.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

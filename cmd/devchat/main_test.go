@@ -92,11 +92,16 @@ func TestTurnWritesAWholeArc(t *testing.T) {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
+	persistor := agent.StampIdentity(store, "session")
+	worker, err := agent.NewArcWorker("session", persistor, store, chat, nil)
+	if err != nil {
+		t.Fatalf("NewArcWorker: %v", err)
+	}
 	session := &session{
 		id:        "session",
 		store:     store,
-		persistor: agent.StampIdentity(store, "session"),
-		agent:     chat,
+		persistor: persistor,
+		worker:    worker,
 		actor:     users.Actor{UserID: "dev", TenantID: "dev"},
 	}
 	if err := session.turn(context.Background(), session.newArcID(), "what is pending?"); err != nil {
@@ -209,7 +214,12 @@ func TestSecondTurnReplaysTheFirst(t *testing.T) {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
-	session := &session{id: "session", store: store, persistor: agent.StampIdentity(store, "session"), agent: chat}
+	persistor := agent.StampIdentity(store, "session")
+	worker, err := agent.NewArcWorker("session", persistor, store, chat, nil)
+	if err != nil {
+		t.Fatalf("NewArcWorker: %v", err)
+	}
+	session := &session{id: "session", store: store, persistor: persistor, worker: worker}
 	for _, message := range []string{"what is running?", "and now?"} {
 		if err := session.turn(context.Background(), session.newArcID(), message); err != nil {
 			t.Fatalf("turn %q: %v", message, err)

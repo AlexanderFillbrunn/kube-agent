@@ -30,9 +30,8 @@ const (
 	// ToolCallStatusCancelled is a call that was still pending, and had never
 	// been dispatched, when its arc was cancelled. It provably never ran.
 	//
-	// A cancel does not settle a call that was already handed to its tool.
-	// That call may still report, and until it does the log cannot say what
-	// became of it, so it stays PENDING in the DISPATCHED phase.
+	// A cancel does not settle a call already handed to its tool. That call
+	// may still report, so it stays PENDING in the DISPATCHED phase.
 	ToolCallStatusCancelled ToolCallStatus = "CANCELLED"
 )
 
@@ -77,9 +76,8 @@ type ToolCall struct {
 	Status   ToolCallStatus
 
 	// DispatchedAt and DispatchedSeq record the first time the call was handed
-	// to its tool, and are nil for a call that provably never ran. They are
-	// past tense on purpose: a worker that died mid-call leaves them set with
-	// no result behind them, which is the case they exist for.
+	// to its tool, and are nil for a call that provably never ran. A worker
+	// that died mid-call leaves them set with no result behind them.
 	DispatchedAt  *time.Time
 	DispatchedSeq *int
 
@@ -94,8 +92,7 @@ type ToolCall struct {
 
 	// FinishedSeq is the sequence number of the event that settled the call,
 	// and is nil while it is still pending. A projection cut off before this
-	// number has to treat the call as unanswered even though the folded
-	// history holds its outcome.
+	// number treats the call as unanswered.
 	FinishedSeq *int
 
 	// Interrupt is the human decision this call is waiting on, or waited on,
@@ -106,10 +103,9 @@ type ToolCall struct {
 	Events []*ToolEvent
 }
 
-// ToolCallPhase is where a call stands, derived from the records the fold
-// wrote rather than stored. Status alone cannot say it: a requested call, one
-// held for a human and one already handed to its tool are all PENDING, and the
-// difference decides whether a recovering worker may run it again.
+// ToolCallPhase is where a call stands, derived rather than stored. Status
+// alone cannot say it: a requested call, one held for a human and one already
+// handed to its tool are all PENDING.
 type ToolCallPhase string
 
 const (
@@ -156,11 +152,8 @@ const (
 	// once the input arrives.
 	AsyncTaskWaiting AsyncTaskStatus = "WAITING"
 	// AsyncTaskCancelled is a task a runner reported it had stopped.
-	//
-	// Cancelling an arc does not set it. A task that has been invoked has
-	// started, and it outlives the run that started it, so the cancel knows
-	// neither whether it stopped nor what it did first. Cancelling stops the
-	// waiting; what became of the task is the runner's to report.
+	// Cancelling an arc does not set it: the cancel ends the waiting, and what
+	// became of the task is the runner's to report.
 	AsyncTaskCancelled AsyncTaskStatus = "CANCELLED"
 )
 
@@ -217,22 +210,20 @@ type ArcStatus string
 
 const (
 	// ArcStatusPending represents an arc that is currently being worked on.
-	ArcStatusPending     ArcStatus = "PENDING"
+	ArcStatusPending ArcStatus = "PENDING"
 	// ArcStatusInterrupted represents an arc whose tool call is waiting for a human to approve it.
 	ArcStatusInterrupted ArcStatus = "INTERRUPTED"
 	// ArcStatusDone represents an arc that has completed through an agent message with no tool calls.
-	ArcStatusDone        ArcStatus = "DONE"
+	ArcStatusDone ArcStatus = "DONE"
 	// ArcStatusCancelled represents an arc that is closed due to user cancellation.
-	ArcStatusCancelled   ArcStatus = "CANCELLED"
+	ArcStatusCancelled ArcStatus = "CANCELLED"
 	// ArcStatusError represents an arc that is closed due to an error.
-	ArcStatusError       ArcStatus = "ERROR"
+	ArcStatusError ArcStatus = "ERROR"
 )
 
-// Arc represents one user message in the conversation, including its responses and other events.
-//
-// An arc is always opened by a user message and owns everything that follows
-// from it. Every other record carries the arc's ID as its correlation ID, which
-// is what nests it here.
+// Arc represents one user message in the conversation, including its responses
+// and other events. Every other record carries the arc's ID as its correlation
+// ID, which is what nests it here.
 type Arc struct {
 	// ID is the correlation ID every record in this arc is tagged with.
 	ID string `json:"id"`
@@ -263,11 +254,11 @@ type Arc struct {
 	AsyncTasks []*AsyncTask `json:"async_tasks"`
 }
 
-// Status computes the status of an arc. This is not a simple field lookup and should be used sparingly.
+// Status computes the status of an arc. It is not a field lookup and should be
+// used sparingly.
 //
-// Three records can close an arc and each says so itself: the close the agent
-// recorded, a fatal error, and a cancel. A reply that requested no calls does
-// not close anything on its own, because work it started can outlive it.
+// Three records can close an arc: the close the agent recorded, a fatal error,
+// and a cancel. A reply that requested no calls closes nothing on its own.
 func (a Arc) Status() ArcStatus {
 	status := ArcStatusPending
 	closedAt := 0
@@ -319,9 +310,8 @@ type AssistantMessage struct {
 	Content   string    `json:"content"`
 
 	// Reasoning is the provider's own record of how the model arrived at this
-	// message, kept as the opaque bytes it arrived as. Providers that accept
-	// it back require it verbatim and alongside the message it belongs to, so
-	// nothing here reads into it or rewrites it.
+	// message, kept as the opaque bytes it arrived as. Providers that take it
+	// back require it verbatim, so nothing here reads into it.
 	Reasoning []byte `json:"reasoning,omitempty"`
 
 	// Usage is what this message cost, and is nil where the provider reported
@@ -385,8 +375,7 @@ type Interrupt struct {
 
 // ArcClosed records the close of one arc. The agent closes an arc once a
 // response has requested no tool calls and no async task under it is still
-// running, so an arc holding a runaway task stays open instead of looking
-// finished because its last message was an answer.
+// running.
 type ArcClosed struct {
 	ID        string    `json:"id"`
 	Seq       int       `json:"seq"`
@@ -418,11 +407,9 @@ type Cancel struct {
 	TerminatedWork bool `json:"terminated_work"`
 }
 
-// Error is a failure recorded against the log. Not a message: nobody said it.
-//
-// A fatal error ends its arc; a non-fatal one is recorded and the arc carries
-// on. Ordering against messages is recoverable either way, since Seq orders the
-// whole log.
+// Error is a failure recorded against the log rather than a message, since
+// nobody said it. A fatal error ends its arc, and a non-fatal one is recorded
+// while the arc carries on.
 type Error struct {
 	ID            string    `json:"id"`
 	Seq           int       `json:"seq"`
@@ -445,10 +432,8 @@ type History struct {
 	Arcs []*Arc
 
 	// LastSeq is the sequence number of the last event applied. Events arrive
-	// in increasing sequence order, skipping numbers wherever another arc's
-	// events fall inside this arc's lifetime: a history is built for one arc,
-	// from a query that takes the events before that arc plus the ones
-	// correlated to it.
+	// in increasing sequence order and may skip numbers, since a history holds
+	// one arc's slice of the log.
 	LastSeq int
 }
 
@@ -486,12 +471,10 @@ func FoldStateFromHistory(h *History) *FoldState {
 }
 
 // Replay left-folds the event log into a history. The events must be in
-// increasing sequence order, and may skip numbers: the log is the slice
-// queried for one arc.
+// increasing sequence order, and may skip numbers.
 //
-// An event the fold rejects stops the replay. A history that silently skipped
-// one would disagree with the log it was built from, and every later event
-// naming the record that never folded would be rejected in turn.
+// An event the fold rejects stops the replay, so a history cannot disagree
+// with the log it was built from.
 func Replay(sessionID string, events []events.Event) (*History, error) {
 	h := NewHistory(sessionID)
 	state := NewFoldState()
@@ -505,13 +488,12 @@ func Replay(sessionID string, events []events.Event) (*History, error) {
 }
 
 // Update folds one event into the history, using state to find the records the
-// event refers to. The event must come after the last one applied, and its type
-// must match its payload; neither the history nor LastSeq changes if it is not.
+// event refers to. The event must come after the last one applied, and its
+// type must match its payload. Neither the history nor LastSeq changes if it
+// does not.
 //
 // Order matters because an event names the record it acts on by ID, so that
-// record has to be folded already. Sequence numbers may skip: the events of
-// one arc are interleaved with other arcs' in the log, and a history holds one
-// arc's slice of it.
+// record has to be folded already. Sequence numbers may skip.
 func (h *History) Update(ev *events.Event, state *FoldState) error {
 	if ev.Seq <= h.LastSeq {
 		return fmt.Errorf("expected event sequence number above %d, got %d", h.LastSeq, ev.Seq)
@@ -571,6 +553,9 @@ func (h *History) applyUserMessage(ev *events.Event, state *FoldState) error {
 	if !ok {
 		return errors.New("expected payload type to be UserMessagePayload")
 	}
+	if ev.CorrelationID == nil {
+		return fmt.Errorf("event %q of type %q has no correlation ID", ev.ID, ev.Typ)
+	}
 
 	arc := &Arc{
 		ID:        *ev.CorrelationID,
@@ -591,7 +576,13 @@ func (h *History) applyAssistantMessage(ev *events.Event, state *FoldState) erro
 	if !ok {
 		return errors.New("expected payload type to be AssistantMessagePayload")
 	}
-	msg := state.arcs[*ev.CorrelationID]
+	if ev.CorrelationID == nil {
+		return fmt.Errorf("event %q of type %q has no correlation ID", ev.ID, ev.Typ)
+	}
+	arc, ok := state.arcs[*ev.CorrelationID]
+	if !ok {
+		return fmt.Errorf("no arc with ID=%s found for assistant message", *ev.CorrelationID)
+	}
 	amsg := &AssistantMessage{
 		ID:            ev.ID,
 		Seq:           ev.Seq,
@@ -602,7 +593,7 @@ func (h *History) applyAssistantMessage(ev *events.Event, state *FoldState) erro
 		Reasoning:     pl.Reasoning,
 		Usage:         pl.Usage,
 	}
-	msg.Responses = append(msg.Responses, amsg)
+	arc.Responses = append(arc.Responses, amsg)
 	state.responses[amsg.ID] = amsg
 
 	return nil
@@ -632,18 +623,13 @@ func (h *History) applyToolCall(ev *events.Event, state *FoldState) error {
 	return nil
 }
 
-// applyToolDispatched records that a call was handed to its tool. Unlike its
-// neighbours it validates nothing beyond the call existing, because it is an
-// observation of something that already happened rather than a transition the
-// fold may permit or refuse.
+// applyToolDispatched records that a call was handed to its tool. It validates
+// nothing beyond the call existing, because it observes something that already
+// happened rather than a transition the fold may refuse.
 //
-// So a dispatch is recorded even for a call that is already terminal. A cancel
-// sweeping an arc races the worker that is dispatching one of its calls, and
-// that is the case where knowing the tool may have run matters most. Refusing
-// the event would fail the whole fold over a bookkeeping record, and dropping
-// it would discard the one fact it carries.
-//
-// It leaves Status alone, so every status but PENDING stays terminal.
+// So a dispatch is recorded even for a call that is already terminal, which is
+// the case where knowing the tool may have run matters most. It leaves Status
+// alone, so every status but PENDING stays terminal.
 func (h *History) applyToolDispatched(ev *events.Event, state *FoldState) error {
 	pl, ok := ev.Payload.(events.ToolDispatchedPayload)
 	if !ok {
@@ -739,12 +725,10 @@ func (h *History) applyInterrupt(ev *events.Event, state *FoldState) error {
 	return nil
 }
 
-// applyInterruptResponse records the human decision, as an approval or a
-// refusal. A refusal settles the call, because the call is never going to run.
-// An approval leaves it pending, because now it will.
+// applyInterruptResponse records the human decision. A refusal settles the
+// call, since it is never going to run. An approval leaves it pending.
 //
-// A decision on an interrupt that is no longer pending is dropped, so a call
-// cancelled while it waited keeps that outcome.
+// A decision on an interrupt that is no longer pending is dropped.
 func (h *History) applyInterruptResponse(ev *events.Event, state *FoldState) error {
 	pl, ok := ev.Payload.(events.InterruptResponsePayload)
 	if !ok {
@@ -789,7 +773,10 @@ func (h *History) applyAsyncTaskInvoke(ev *events.Event, state *FoldState) error
 	if ev.CorrelationID == nil {
 		return fmt.Errorf("event %q of type %q has no correlation ID", ev.ID, ev.Typ)
 	}
-	arc := state.arcs[*ev.CorrelationID]
+	arc, ok := state.arcs[*ev.CorrelationID]
+	if !ok {
+		return fmt.Errorf("no arc with ID=%s found for async task invoke", *ev.CorrelationID)
+	}
 
 	task := &AsyncTask{
 		ID:            ev.ID,
@@ -821,15 +808,28 @@ func (h *History) applyAsyncTaskResult(ev *events.Event, state *FoldState) error
 	if task.FinishedAt != nil {
 		return nil
 	}
+	if !pl.Outcome.Valid() {
+		return fmt.Errorf("async task result for %s carries no outcome", pl.CausationID)
+	}
 	task.Result = pl.Result
 	task.FinishedAt = &ev.Timestamp
 	task.FinishedSeq = &ev.Seq
-	if pl.IsError {
-		task.Status = AsyncTaskFailed
-	} else {
-		task.Status = AsyncTaskSuccess
-	}
+	task.Status = taskStatusOf(pl.Outcome)
 	return nil
+}
+
+// taskStatusOf carries a reported outcome into the status a reader sees. The
+// two are separate types because a status also covers a task that has not
+// ended, which no result can report.
+func taskStatusOf(outcome events.AsyncTaskOutcome) AsyncTaskStatus {
+	switch outcome {
+	case events.AsyncTaskOutcomeFailed:
+		return AsyncTaskFailed
+	case events.AsyncTaskOutcomeCancelled:
+		return AsyncTaskCancelled
+	default:
+		return AsyncTaskSuccess
+	}
 }
 
 // applyAsyncTaskEvent appends a notification to the task's transcript without
@@ -887,8 +887,11 @@ func (h *History) applyError(ev *events.Event, state *FoldState) error {
 	if ev.CorrelationID == nil {
 		return fmt.Errorf("event %q of type %q has no correlation ID", ev.ID, ev.Typ)
 	}
-	msg := state.arcs[*ev.CorrelationID]
-	msg.Errors = append(msg.Errors, &Error{
+	arc, ok := state.arcs[*ev.CorrelationID]
+	if !ok {
+		return fmt.Errorf("no arc with ID=%s found for error", *ev.CorrelationID)
+	}
+	arc.Errors = append(arc.Errors, &Error{
 		ID:            ev.ID,
 		Seq:           ev.Seq,
 		IsFatal:       pl.IsFatal,
@@ -953,10 +956,8 @@ func (h *History) applyCancel(ev *events.Event, state *FoldState) error {
 			}
 
 			// A call already handed to its tool is not the cancel's to
-			// settle. It may still report, and whether it took effect is not
-			// something the cancel knows; saying CANCELLED here would put a
-			// definite outcome on the log in place of an open question. The
-			// call keeps its phase, and a result that arrives later settles it
+			// settle. It may still report, and the cancel does not know
+			// whether it took effect, so a result arriving later settles it
 			// the ordinary way.
 			if call.DispatchedSeq != nil {
 				stoppedSomething = true
@@ -974,10 +975,9 @@ func (h *History) applyCancel(ev *events.Event, state *FoldState) error {
 		if task.Status != AsyncTaskPending && task.Status != AsyncTaskWaiting {
 			continue
 		}
-		// A task that was invoked has started, and it runs somewhere the
-		// cancel cannot reach. Marking it cancelled would record an outcome
-		// nobody observed. The cancel ends the waiting, which is a fact about
-		// this arc; what became of the task is reported by whoever runs it.
+		// A task that was invoked runs somewhere the cancel cannot reach, so
+		// marking it cancelled would record an outcome nobody observed. The
+		// cancel ends the waiting, and the runner reports the rest.
 		stoppedSomething = true
 	}
 

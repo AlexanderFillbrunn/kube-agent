@@ -11,28 +11,20 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// The task here is a goroutine pretending to be work that runs somewhere else.
-// It stands in for a Kubernetes job or a queue consumer, and what makes it a
-// fair stand-in is that it reports the way one of those would: by calling the
-// ingress, not by writing to the log. Nothing it does is a shortcut the real
-// thing would not have.
+// The task here is a goroutine standing in for work that runs somewhere else.
+// It reports the way a real one would, by calling the ingress rather than
+// writing to the log.
 //
-// It also carries the part of an implementation that belongs to whoever writes
-// the task rather than to the agent. A goroutine has no address that outlives
-// its process, so reaching one needs a table of handles. That table lives here,
-// in the implementation, and is never consulted for status: what a task is
-// doing is read from the log.
+// Reaching a goroutine needs a table of handles. That table lives here, in the
+// implementation, and is never consulted for status: what a task is doing is
+// read from the log.
 
 // auditDelay is how long the fake audit spends on each of its steps. It is a
 // variable so a test does not have to wait out a demo.
 var auditDelay = 4 * time.Second
 
 // localTasks runs tasks as goroutines and is the controller that reaches them.
-//
-// The two halves are one object because they share the handle table, which is
-// exactly the coupling the design puts on the implementer: the agent asks a
-// registry to start work and a controller to reach it, and never learns that
-// either of them is this.
+// The two halves are one object because they share the handle table.
 type localTasks struct {
 	mu      sync.Mutex
 	running map[string]*localTask
@@ -88,9 +80,8 @@ func (l *localTasks) register(registry *agent.TaskRegistry) error {
 }
 
 // start launches an audit and returns, the way a call to a job runner would.
-//
-// The context is not the run's. A run ends when the model has said its piece,
-// and a task that died with it would be a task that never outlived anything.
+// The context is not the run's, since a task outlives the run that started
+// it.
 func (l *localTasks) start(_ context.Context, ref agent.TaskRef, args any) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	task := &localTask{input: make(chan string, 1), cancel: cancel}
@@ -142,9 +133,8 @@ func (l *localTasks) forget(id string) {
 }
 
 // audit is the work. It reports twice, stops to ask a question, and finishes.
-//
-// Every report goes through the ingress, so the path a real task would take is
-// the path this one takes: write the event, then give the arc a turn.
+// Every report goes through the ingress: write the event, then give the arc a
+// turn.
 func (l *localTasks) audit(ctx context.Context, ref agent.TaskRef, task *localTask) {
 	defer l.forget(ref.ID)
 
@@ -195,11 +185,9 @@ func (l *localTasks) stopped(ref agent.TaskRef) {
 	})
 }
 
-// report calls the ingress and tells the screen what was said.
-//
-// A report that cannot be filed is shown and dropped. There is nobody above a
-// task to hand a failure to: the run that started it is long over, and the log
-// is the thing that was unavailable.
+// report calls the ingress and tells the screen what was said. A report that
+// cannot be filed is shown and dropped, since there is nobody above a task to
+// hand the failure to.
 func (l *localTasks) report(ref agent.TaskRef, report agent.TaskReport) {
 	l.mu.Lock()
 	reports, watcher, deferred := l.reports, l.watcher, l.deferred

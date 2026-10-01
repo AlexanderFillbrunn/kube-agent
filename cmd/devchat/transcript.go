@@ -9,11 +9,9 @@ import (
 	"fillbrunn.ai/kube-agent/pkg/history"
 )
 
-// This file turns a run into something renderable, and nothing here draws.
-// The transcript is fed from two directions — text as the model streams it,
-// and events as the agent records them — and it is the events that are
-// authoritative: a reply is the one the log holds, not the one the tokens
-// happened to spell.
+// This file turns a run into something renderable, and nothing here draws. The
+// transcript is fed from two directions, text as the model streams it and
+// events as the agent records them, and the events are authoritative.
 
 type blockKind int
 
@@ -112,9 +110,7 @@ func (t *transcript) fromHistory(h *history.History) {
 		}
 
 		// Tasks come after the arc's replies rather than in the order they
-		// were invoked. A task is shown as where it has got to, and where it
-		// has got to is a thing about now, not about the point in the
-		// conversation it was started at.
+		// were invoked, since a task is shown as where it has got to now.
 		for _, task := range arc.AsyncTasks {
 			shown := &block{
 				kind:  blockTask,
@@ -268,12 +264,9 @@ func (t *transcript) onTask(taskID string, state toolState, text string) {
 	task.text = text
 }
 
-// taskSaid shows what a task reported.
-//
-// It comes from the task rather than from the log, because what the log holds
-// is written on a goroutine of its own and never passes the sink the interface
-// watches. The line it lands on is the same one the log's own records reach, so
-// a reopened session and a running one look alike.
+// taskSaid shows what a task reported. It comes from the task rather than the
+// log, which is written on a goroutine the interface does not watch. The line
+// it lands on is the one the log's own records reach.
 func (t *transcript) taskSaid(taskID, name, text string, state toolState) {
 	task, ok := t.tasks[taskID]
 	if !ok {
@@ -286,15 +279,10 @@ func (t *transcript) taskSaid(taskID, name, text string, state toolState) {
 }
 
 // runningTasks names the tasks that have not finished, in the order they were
-// started.
+// started. It reads the transcript rather than the log, which the interface
+// already keeps up to date.
 //
-// It reads the transcript rather than the log because the transcript is what
-// the interface already keeps up to date: a task reports from a goroutine of
-// its own, and re-reading the file on every redraw to say the same thing would
-// be work for nothing.
-//
-// A task waiting on input counts as running. It has not finished, and it is the
-// one most worth naming: somebody has to answer it.
+// A task waiting on input counts as running.
 func (t *transcript) runningTasks() []string {
 	var names []string
 	for _, b := range t.blocks {
@@ -310,11 +298,9 @@ func (t *transcript) note(text string) {
 	t.blocks = append(t.blocks, &block{kind: blockNote, text: text})
 }
 
-// fail records something that went wrong.
-//
-// The agent writes down what it could not finish, so a failed run reaches the
-// screen twice: once as the error it recorded and once as the error it
-// returned. They say the same thing, and it is only worth saying once.
+// fail records something that went wrong. A failed run reaches the screen
+// twice, as the error the agent recorded and as the error it returned, so the
+// repeat is dropped.
 func (t *transcript) fail(err error) {
 	t.streaming = nil
 	if len(t.blocks) > 0 {

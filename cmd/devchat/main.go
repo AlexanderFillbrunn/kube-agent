@@ -1,23 +1,17 @@
 // Command devchat is a terminal harness for driving the agent by hand.
 //
-// It is a development tool, not the product: it talks to one model over one
-// file-based log, offers tools that answer from canned data and touch no
-// cluster, and keeps every session in a file you can read. Nothing here is
-// built to be deployed, and the storage it leans on lives under internal/ so
-// it cannot be mistaken for the real thing.
+// It is a development tool, not the product. It talks to one model over one
+// file-based log and offers tools that answer from canned data.
 //
 //	export OPENAI_API_KEY=...
 //	go run ./cmd/devchat
 //
-// Type a message and the agent runs until it is your turn again, with the
-// reply arriving as it is written and each tool call showing what it is doing.
-// Enter sends and esc leaves. A run in progress is stopped by ctrl+c or by
-// /cancel, which takes a reason the model is told about; either way the arc is
-// withdrawn in the log rather than merely dropped on the screen.
+// Type a message and the agent runs until it is your turn again. Enter sends
+// and esc leaves. A run in progress is stopped by ctrl+c or by /cancel, which
+// withdraws the arc in the log rather than dropping it on the screen.
 //
-// Sessions are kept under .devchat/ rather than beside the source. Pointing
-// -store at a log again resumes that conversation, and /clear moves the
-// current one aside and starts another.
+// Sessions are kept under .devchat/. Pointing -store at a log again resumes
+// that conversation, and /clear moves the current one aside.
 package main
 
 import (
@@ -103,9 +97,7 @@ func run(storePath, modelName, baseURL, systemPrompt, userID string) error {
 		},
 		registry,
 		// The guard turns a cancel recorded in the log into a run that stops,
-		// which is what lets a cancel from anywhere but this process take
-		// effect. Here that is only ever this process, so it earns its keep as
-		// the wiring rather than the feature.
+		// wherever the cancel was recorded.
 		llm,
 		agent.WithTasks(tasks, runner),
 	)
@@ -114,11 +106,18 @@ func run(storePath, modelName, baseURL, systemPrompt, userID string) error {
 	}
 
 	persistor := agent.StampIdentity(agent.GuardCancellation(store, store), storePath)
+	// One worker for the session, so that a person's turn, a task's report
+	// and anything else that enters an arc contend for the same lease.
+	worker, err := agent.NewArcWorker(storePath, persistor, store, chat, agent.NewLocalLease())
+	if err != nil {
+		return err
+	}
+
 	session := &session{
 		id:         storePath,
 		store:      store,
 		persistor:  persistor,
-		agent:      chat,
+		worker:     worker,
 		actor:      users.Actor{UserID: userID, TenantID: "dev"},
 		controller: runner,
 	}
@@ -126,7 +125,7 @@ func run(storePath, modelName, baseURL, systemPrompt, userID string) error {
 	// The inbound half. A task calls this rather than writing to the log, which
 	// is the path a job somewhere else would have to take, so the harness
 	// exercises it rather than going around it.
-	reports, err := agent.NewTaskReports(storePath, persistor, store, chat, agent.NewLocalLease())
+	reports, err := agent.NewTaskReports(worker)
 	if err != nil {
 		return err
 	}
@@ -144,10 +143,9 @@ func run(storePath, modelName, baseURL, systemPrompt, userID string) error {
 		return err
 	}
 
-	// A task in that log is one this process started and then died on, because
-	// the only runner here is this one. Left alone it would hold its arc open
-	// for ever and put a note about work in flight in front of the model on
-	// every turn from now on.
+	// The only runner here is this process, so a task in that log is one an
+	// earlier process died on. Left alone it would hold its arc open for
+	// ever.
 	settled, err := agent.SettleAbandonedTasks(context.Background(), persistor, recorded)
 	if err != nil {
 		return err
@@ -161,7 +159,7 @@ func run(storePath, modelName, baseURL, systemPrompt, userID string) error {
 	existing := newTranscript()
 	existing.fromHistory(recorded)
 
-	program := tea.NewProgram(newModel(session, relay, llm, existing, reports))
+	program := tea.NewProgram(newModel(session, relay, llm, existing, worker))
 	relay.attach(program)
 
 	_, err = program.Run()

@@ -548,7 +548,7 @@ func awaitedTaskArc(t *testing.T, resultSeq int) *history.History {
 		{ID: "a-1", Seq: 2, Timestamp: at, Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc,
 			Payload: events.AsyncTaskInvokePayload{TaskName: "auditor"}},
 		{ID: "ar-1", Seq: resultSeq, Timestamp: at, Typ: events.AsyncTaskResultEventType, CorrelationID: &arc,
-			Payload: events.AsyncTaskResultPayload{CausationID: "a-1", Result: "3 findings"}},
+			Payload: events.AsyncTaskResultPayload{CausationID: "a-1", Result: "3 findings", Outcome: events.AsyncTaskOutcomeSuccess}},
 		{ID: "msg-2", Seq: 4, Timestamp: at, Typ: events.AssistantMessageEventType, CorrelationID: &arc,
 			Payload: events.AssistantMessagePayload{ModelID: "gpt-5", Content: "the audit is running"}},
 	}

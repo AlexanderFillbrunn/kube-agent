@@ -35,20 +35,11 @@ type EventSource interface {
 	GetEventsForArc(ctx context.Context, id string) ([]*events.Event, error)
 }
 
-// StampIdentity gives an event the identity it is filed under: the session it
-// belongs to, an ID, and the time it happened.
+// StampIdentity gives an event the session it belongs to, an ID and a
+// timestamp. The sequence number stays the store's to assign.
 //
-// None of the three needs to know anything about the log, so none of them is
-// the store's to invent: a store that minted them would be reimplementing the
-// same three lines, and differently. What a store does own is the sequence
-// number, which is the one part of an identity that is a fact about the log
-// rather than about the event, and which only the writer holding the log can
-// assign.
-//
-// The time is taken here rather than at the append, so it reads as when the
-// agent did the thing rather than when the write reached disk. A write that
-// waits behind something can therefore carry a timestamp slightly before an
-// event with a lower sequence number; where the two disagree, the sequence
+// The timestamp is taken here rather than at the append, so two events can
+// carry times in the opposite order to their sequence numbers. The sequence
 // number is the order.
 func StampIdentity(persistor EventPersistor, sessionID string) EventPersistor {
 	return &stampingPersistor{persistor: persistor, sessionID: sessionID}
@@ -60,14 +51,11 @@ type stampingPersistor struct {
 }
 
 func (s *stampingPersistor) Persist(ctx context.Context, ev *events.Event) (*events.Event, error) {
-	// The caller's event is left alone, since it is theirs and they may still
-	// be holding it.
+	// The caller's event is left alone, since they may still be holding it.
 	stamped := *ev
 	stamped.SessionID = s.sessionID
 	// An ID or a time already set is kept, which is how a caller ties two
-	// events together before either is written, or replays a record of
-	// something that happened earlier. Nothing here checks such an ID is
-	// unique.
+	// events together before either is written. Uniqueness is not checked.
 	if stamped.ID == "" {
 		stamped.ID = NewEventID()
 	}

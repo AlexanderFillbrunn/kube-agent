@@ -10,8 +10,7 @@ import (
 
 // A line starting with a slash is an instruction to the harness rather than
 // something to say to the model. Most commands only run between turns, and the
-// few that do not say so: a command that can reach into a run has to be
-// written for one, and the default is the assumption that it was not.
+// few that do not say so.
 
 // slashCommand is one thing that can be typed instead of a message.
 type slashCommand struct {
@@ -23,9 +22,7 @@ type slashCommand struct {
 	summary string
 
 	// duringTurn lets a command be typed while the agent is working. It is off
-	// by default because the others would be wrong there: switching model
-	// halfway through a run leaves the arc split between two, and clearing
-	// moves the log out from under a run still writing to it.
+	// by default, since most commands would corrupt a run in progress.
 	duringTurn bool
 
 	// run is given whatever followed the command name, trimmed.
@@ -91,15 +88,12 @@ func runCommand(m model, line string) (model, tea.Cmd) {
 	return m.refresh(), nil
 }
 
-// cancelTurn withdraws the run in progress.
+// cancelTurn withdraws the run in progress. The record goes down before the
+// run is stopped, so the log never shows an arc being worked on after the run
+// has ended.
 //
-// The record goes down before the run is stopped. Stopping first would leave a
-// window where the run has ended and the log still shows an arc being worked
-// on, and it is the log a resumed session reads.
-//
-// Nothing is printed here for the cancel itself: stopping the run brings the
-// turn back through turnDoneMsg, which says so once. A reason is not echoed
-// either, since the model is the one it was written for.
+// Nothing is printed here: stopping the run brings the turn back through
+// turnDoneMsg, which says so once.
 func cancelTurn(m model, reason string) (model, tea.Cmd) {
 	if !m.running() {
 		m.transcript.note("nothing is running")
@@ -121,12 +115,9 @@ func cancelTurn(m model, reason string) (model, tea.Cmd) {
 // switchModel points the rest of the session at another model, and with no
 // name says which one is being used.
 //
-// Nothing is checked here, because nothing can be: whether a name is a model
-// this endpoint serves is only answered by asking it. A name that is not
-// shows up as a failed turn.
-//
-// The conversation carries over. Every reply already records the model that
-// produced it, so a session that changed models halfway stays readable as one.
+// Nothing is checked, since whether an endpoint serves a name is only answered
+// by asking it. A wrong name shows up as a failed turn. The conversation
+// carries over, and every reply records the model that produced it.
 func switchModel(m model, name string) (model, tea.Cmd) {
 	if name == "" {
 		m.transcript.note("using " + m.llm.Model)
@@ -143,11 +134,8 @@ func switchModel(m model, name string) (model, tea.Cmd) {
 	return m.refresh(), nil
 }
 
-// clearSession starts the conversation over.
-//
-// Clearing only the screen would be a lie: the next turn replays the log, so
-// the model would go on remembering what the screen had forgotten. The log is
-// moved aside instead, which is the only way the two agree.
+// clearSession starts the conversation over. The log is moved aside rather
+// than the screen cleared, since the next turn replays the log.
 func clearSession(m model, _ string) (model, tea.Cmd) {
 	archived, err := m.session.store.Rotate()
 	if err != nil {

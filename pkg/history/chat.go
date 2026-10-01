@@ -114,9 +114,8 @@ func renderToolCall(call *ToolCall) string {
 }
 
 // renderToolStatus colors an outcome so it is distinguishable at a glance. A
-// call with no outcome yet shows its phase instead, because a reader watching
-// an arc wants to know whether the tool has been handed the call and PENDING
-// covers both answers.
+// call with no outcome yet shows its phase instead, since PENDING does not say
+// whether the tool has been handed the call.
 func renderToolStatus(call *ToolCall) string {
 	style := pendingStatusStyle
 	switch call.Status {

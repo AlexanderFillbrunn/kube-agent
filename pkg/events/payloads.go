@@ -22,25 +22,20 @@ type AssistantMessagePayload struct {
 	CancelPolicy *string `json:"cancel_policy,omitempty"`
 	Reasoning    []byte  `json:"reasoning,omitempty"`
 
-	// Usage is what the message cost, as the provider reported it, and is nil
-	// where it reported nothing. Nil is not zero: a message whose cost went
-	// unreported must not be summed in as a free one.
+	// Usage is what the message cost, as the provider reported it. It is nil
+	// where the provider reported nothing, which is not the same as zero.
 	Usage *TokenUsage `json:"usage,omitempty"`
 }
 
 // TokenUsage is what one message cost, in tokens.
 type TokenUsage struct {
-	// Input counts every prompt token, the cached ones included. CachedInput
-	// is a part of this number rather than an addition to it, which is how
-	// providers report it and how they bill it.
+	// Input counts every prompt token, CachedInput included.
 	Input int `json:"input"`
 
-	// CachedInput is the part of the prompt served from the provider's cache,
-	// billed at a lower rate than the rest.
+	// CachedInput is the part of the prompt served from the provider's cache.
 	CachedInput int `json:"cached_input"`
 
-	// Output counts the tokens the model generated, reasoning tokens included
-	// where the provider charges for them.
+	// Output counts the tokens the model generated, reasoning included.
 	Output int `json:"output"`
 }
 
@@ -62,14 +57,11 @@ func (ToolCallPayload) EventType() EventType {
 func (ToolCallPayload) eventPayload() {}
 
 // ToolDispatchedPayload records that a tool call was handed to its tool. It is
-// the one payload that says nothing about the conversation: it is execution
-// bookkeeping, never disclosed to the model, and exists so a worker recovering
-// an abandoned arc can tell a call that may have taken effect from one that
-// provably never ran.
+// execution bookkeeping and is never disclosed to the model.
 //
-// It is written before the call is dispatched and never amended, so it states
-// that the call left the building and not that it is still running. A retry
-// writes another one rather than replacing this.
+// It is written before the call is dispatched and never amended, so it says
+// the call was handed over and not that it is still running. A retry writes
+// another one.
 type ToolDispatchedPayload struct {
 	CausationID string `json:"causation_id"`
 }
@@ -100,10 +92,9 @@ func (ToolEventPayload) EventType() EventType {
 }
 func (ToolEventPayload) eventPayload() {}
 
-// InterruptPayload pauses a tool call until a human decides on it. An
-// interrupt is the human-in-the-loop gate and nothing else: it always names
-// the call it holds up. A policy that refuses a call without asking anyone is
-// a GuardrailBlockedPayload.
+// InterruptPayload pauses a tool call until a human decides on it. It always
+// names the call it holds up. A policy that refuses a call without asking
+// anyone writes a GuardrailBlockedPayload instead.
 type InterruptPayload struct {
 	// ToolCallID is the call waiting on the decision.
 	ToolCallID string `json:"tool_call_id"`
@@ -111,10 +102,8 @@ type InterruptPayload struct {
 	// Reason is what the human is being asked to decide about, in words.
 	Reason string `json:"reason"`
 
-	// Context is what the decision is about beyond the call's own arguments:
-	// what the call would touch, which policy asked for a human, whatever
-	// else the person deciding needs. It is set when the interrupt is raised
-	// and never changes.
+	// Context is what the decision is about beyond the call's own arguments.
+	// It is set when the interrupt is raised and never changes.
 	Context any `json:"context,omitempty"`
 }
 
@@ -145,10 +134,38 @@ func (AsyncTaskInvokePayload) EventType() EventType {
 }
 func (AsyncTaskInvokePayload) eventPayload() {}
 
+// AsyncTaskOutcome is how a task ended, as the runner reported it. A result
+// can only say that a task is over, so it carries none of the states a running
+// task has.
+type AsyncTaskOutcome string
+
+const (
+	// AsyncTaskOutcomeSuccess is a task that finished and returned a result.
+	AsyncTaskOutcomeSuccess AsyncTaskOutcome = "SUCCESS"
+	// AsyncTaskOutcomeFailed is a task that ran and reported a failure.
+	AsyncTaskOutcomeFailed AsyncTaskOutcome = "FAILED"
+	// AsyncTaskOutcomeCancelled is a runner reporting that it stopped. Only a
+	// runner can say this, since cancelling an arc asks a task to stop without
+	// settling it.
+	AsyncTaskOutcomeCancelled AsyncTaskOutcome = "CANCELLED"
+)
+
+// Valid reports whether the outcome is one a runner may report. The fold
+// refuses a result carrying anything else.
+func (o AsyncTaskOutcome) Valid() bool {
+	switch o {
+	case AsyncTaskOutcomeSuccess, AsyncTaskOutcomeFailed, AsyncTaskOutcomeCancelled:
+		return true
+	}
+	return false
+}
+
+// AsyncTaskResultPayload settles a task. Outcome is a value rather than an
+// error flag, because work that was called off is not work that failed.
 type AsyncTaskResultPayload struct {
-	CausationID string `json:"causation_id"`
-	Result      any    `json:"result"`
-	IsError     bool   `json:"is_error"`
+	CausationID string           `json:"causation_id"`
+	Result      any              `json:"result"`
+	Outcome     AsyncTaskOutcome `json:"outcome"`
 }
 
 func (AsyncTaskResultPayload) EventType() EventType {
@@ -209,9 +226,7 @@ func (GuardrailBlockedPayload) EventType() EventType {
 func (GuardrailBlockedPayload) eventPayload() {}
 
 // ArcClosedPayload closes an arc. The agent emits it once a response has
-// requested no tool calls and no async task under the arc is still running, so
-// closing is a recorded fact rather than something a reader infers from the
-// shape of the last message.
+// requested no tool calls and no async task under the arc is still running.
 type ArcClosedPayload struct {
 	// CausationID is the assistant message that concluded the arc.
 	CausationID string `json:"causation_id"`

@@ -23,11 +23,9 @@ const (
 // is not usable; build one with NewOpenAI.
 type OpenAI struct {
 	// Model is the model ID sent with every request. It may be changed between
-	// requests, which is how a caller switches models mid-session; changing it
-	// while a request is in flight is a race.
-	//
-	// What a reply was actually produced by is not read back from here: the
-	// provider reports it, and that is what the log records.
+	// requests to switch models mid-session, but changing it while a request
+	// is in flight is a race. What a reply was produced by is read from the
+	// provider's answer, not from here.
 	Model string
 
 	// BaseURL is the API root without a trailing slash, so an
@@ -37,9 +35,8 @@ type OpenAI struct {
 	apiKey string
 	client *http.Client
 
-	// modes is how much of the log each request discloses. It is fixed for
-	// the session, which is what makes a projection a pure function of the
-	// log and the arc.
+	// modes is how much of the log each request discloses. It is fixed for the
+	// session, so a projection is a pure function of the log and the arc.
 	modes history.Modes
 
 	// noteRole carries synthesized notes. OpenAI offers `developer` and
@@ -129,8 +126,7 @@ func (u *openAIUsage) tokenUsage() *TokenUsage {
 }
 
 // StreamResponse asks the model for one response and streams its text to
-// tokSink as it arrives. A token is a display concern: the reply itself is
-// returned whole, so a half-received message never becomes one.
+// tokSink as it arrives. The reply itself is returned whole.
 func (o *OpenAI) StreamResponse(ctx context.Context, h *history.History, opts *LLMOptions, tokSink Sink[string]) (*LLMResponse, error) {
 	return o.respond(ctx, h, opts, tokSink)
 }
@@ -140,8 +136,8 @@ func (o *OpenAI) Response(ctx context.Context, h *history.History, opts *LLMOpti
 	return o.respond(ctx, h, opts, nil)
 }
 
-// respond runs one exchange. A nil tokSink is what distinguishes the two entry
-// points, because everything else about them is the same.
+// respond runs one exchange. A nil tokSink means the response is not
+// streamed.
 func (o *OpenAI) respond(ctx context.Context, h *history.History, opts *LLMOptions, tokSink Sink[string]) (*LLMResponse, error) {
 	if opts == nil {
 		opts = &LLMOptions{}
@@ -175,9 +171,8 @@ func (o *OpenAI) respond(ctx context.Context, h *history.History, opts *LLMOptio
 	return o.asResponse(completion), nil
 }
 
-// targetArc returns the arc the response belongs to. A history is built for
-// one arc and that arc is the last one in it, since every earlier arc was
-// opened by an earlier user message.
+// targetArc returns the arc the response belongs to, which is the last arc in
+// the history.
 func targetArc(h *history.History) (*history.Arc, error) {
 	if h == nil || len(h.Arcs) == 0 {
 		return nil, errors.New("cannot respond to a history with no arcs")
@@ -323,9 +318,7 @@ type openAIChunk struct {
 }
 
 // openAIToolCallDelta is a fragment of one tool call. Index identifies the
-// call within the message, and is the only field every fragment carries: the
-// name and ID arrive once, and the arguments arrive a few characters at a
-// time.
+// call within the message and is the only field every fragment carries.
 type openAIToolCallDelta struct {
 	Index    int    `json:"index"`
 	ID       string `json:"id"`
@@ -438,8 +431,8 @@ func applyChunk(completion *openAICompletion, calls map[int]*openAIToolCall, ord
 }
 
 // asResponse turns a completion into the reply the agent records. The model
-// the provider reports is preferred over the one that was asked for, since an
-// alias resolves to a dated model and the log should name the one that ran.
+// the provider reports is preferred over the one that was asked for, so the
+// log names the model that ran rather than an alias.
 func (o *OpenAI) asResponse(completion *openAICompletion) *LLMResponse {
 	response := &LLMResponse{
 		ModelID: completion.model,
@@ -464,9 +457,8 @@ func (o *OpenAI) asResponse(completion *openAICompletion) *LLMResponse {
 }
 
 // decodeArguments parses the arguments the model produced. Malformed JSON is
-// kept verbatim rather than rejected here: the call is what the model asked
-// for, and refusing it at the log would lose the record the model has to be
-// told about before it can correct itself.
+// kept verbatim, so the model is told about the call it made and can correct
+// itself.
 func decodeArguments(raw string) any {
 	if strings.TrimSpace(raw) == "" {
 		return map[string]any{}

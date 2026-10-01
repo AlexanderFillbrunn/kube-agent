@@ -9,7 +9,7 @@ import (
 // LLMOptions holds information for an LLM to control how new prompts are handled.
 type LLMOptions struct {
 	SystemPrompt string
-	Tools        *ToolRegistry
+	Tools        ToolSet
 }
 
 type Token struct {
@@ -18,9 +18,7 @@ type Token struct {
 }
 
 // LLMResponse is one reply from a model: what it said and the calls it asked
-// for. It is what the model produced, not yet a record of it. The agent turns
-// it into events, because a tool call names the message that requested it and
-// only the persistor knows that message's ID.
+// for. The agent turns it into events.
 type LLMResponse struct {
 	// VendorID is the provider's own identifier for the message, where the
 	// provider issues one.
@@ -37,9 +35,8 @@ type LLMResponse struct {
 	// returns none.
 	Reasoning []byte
 
-	// Usage is what the reply cost, and is nil where the provider reported
-	// nothing. Nil is not zero: a reply whose cost went unreported must not
-	// be counted as a free one.
+	// Usage is what the reply cost. It is nil where the provider reported
+	// nothing, which is not the same as zero.
 	Usage *TokenUsage
 
 	ToolCalls []LLMToolCall
@@ -47,17 +44,13 @@ type LLMResponse struct {
 
 // TokenUsage is what one exchange cost, in tokens.
 type TokenUsage struct {
-	// Input counts every prompt token, the cached ones included. CachedInput
-	// is a part of this number rather than an addition to it, which is how
-	// providers report it and how they bill it.
+	// Input counts every prompt token, CachedInput included.
 	Input int
 
-	// CachedInput is the part of the prompt that was served from the
-	// provider's cache, and is billed at a lower rate than the rest.
+	// CachedInput is the part of the prompt served from the provider's cache.
 	CachedInput int
 
-	// Output counts the tokens the model generated, reasoning tokens
-	// included where the provider charges for them.
+	// Output counts the tokens the model generated, reasoning included.
 	Output int
 }
 

@@ -61,8 +61,7 @@ type ModelAssistantMessage struct {
 
 	// Reasoning is the provider's record of how the model reached this
 	// message, opaque to everything here, and is nil where the projection
-	// could not carry it. It is only ever the reasoning of the message it sits
-	// on: a provider that accepts it back checks it against that message.
+	// could not carry it. It only ever belongs to the message it sits on.
 	Reasoning []byte
 }
 
@@ -188,10 +187,7 @@ type Modes struct {
 	// ForeignArc governs an arc other than the one being projected that the
 	// log does not show as closed: still open, dead of a fatal error, or
 	// withdrawn before anything was attempted. An arc that closed normally is
-	// ordinary conversation history and is kept.
-	//
-	// One mode covers all three, so an arc is governed the same way at every
-	// cutoff as its status changes.
+	// kept as ordinary conversation history.
 	ForeignArc Treatment // keep | note | elide
 
 	// Pending governs tool calls with no result at the cutoff.
@@ -214,15 +210,11 @@ type Modes struct {
 	Interrupt Treatment // note | elide
 
 	// QuoteLimit is how much of a request a note may quote, in characters.
-	//
 	// A note names the request it is about so the model can tell which one is
-	// meant, and naming is not repeating: a long request quoted whole is that
-	// request put in front of the model twice, once as itself and once as the
-	// note about it. Enough to recognise it is enough.
+	// meant, which takes less than the whole of it. 0 quotes it whole.
 	//
-	// It is not a treatment. Every mode above decides whether a record is
-	// disclosed; this decides how much of one is spelled out in a note that
-	// was already going to be sent. 0 quotes the request whole.
+	// It is not a treatment: the modes above decide whether a record is
+	// disclosed, and this decides how much of one a note spells out.
 	QuoteLimit int
 }
 
@@ -272,11 +264,9 @@ func (m Modes) Validate() error {
 	return nil
 }
 
-// Project builds the transcript for one arc.
-//
-// The history must be the one the read model produced for this arc: every
-// event up to the arc's own user message, plus every later event correlated to
-// it. That query is the projection's cutoff.
+// Project builds the transcript for one arc. The history must be the one the
+// read model produced for this arc: every event up to the arc's own user
+// message, plus every later event correlated to it. That query is the cutoff.
 func (h *History) Project(arcID string, modes Modes) (*ModelTranscript, error) {
 	if h == nil {
 		return nil, errors.New("history must not be nil")
@@ -323,10 +313,9 @@ func newProjector(history *History, target *Arc, modes Modes) *projector {
 	return &projector{history: history, target: target, modes: modes}
 }
 
-// run walks the arcs the history holds, once, and emits what survives. The
-// history was built for the target arc: a foreign arc's records all precede
-// the target's user message, and the target owns everything correlated to it
-// however late it arrived.
+// run walks the arcs the history holds, once, and emits what survives. A
+// foreign arc's records all precede the target's user message, and the target
+// owns everything correlated to it.
 func (p *projector) run() {
 	for _, arc := range p.history.Arcs {
 		p.projectArc(arc)
@@ -402,20 +391,15 @@ func (p *projector) projectArc(arc *Arc) {
 
 	// The note goes with the material, including when the material is nothing
 	// but the user message. A bare user turn reads as a request addressed to
-	// this turn, and an assistant message belongs to exactly one arc, so a
-	// model that answers both files the answer to the foreign one under the
-	// wrong arc and leaves that arc open with no response.
+	// this turn, which a model would answer under the wrong arc.
 	if plan.status != arcNoteNone {
 		p.emitArcNote(arc, plan)
 	}
 }
 
 // quote renders a request for a note: one line, cut to the length the session
-// allows.
-//
-// A quote is folded onto one line because a note is one line, and a request
-// that was cut says so with an ellipsis, so that a shortened request cannot be
-// read as one that was always that short.
+// allows. A request that was cut ends in an ellipsis, so it cannot be read as
+// one that was always that short.
 func (p *projector) quote(content string) string {
 	folded := strings.Join(strings.Fields(content), " ")
 	if p.modes.QuoteLimit <= 0 || len([]rune(folded)) <= p.modes.QuoteLimit {
@@ -441,8 +425,7 @@ func planArc(arc *Arc, modes Modes, isTarget bool) arcPlan {
 	case status == ArcStatusCancelled:
 		// The cancel closed the arc, so it stopped either work in progress or
 		// a request nothing had been done about yet. A cancel that reached
-		// only an async task lands under Done instead, and that task's own
-		// note reports what happened to it.
+		// only an async task lands under Done instead.
 		plan.statusSeq = arc.Cancel.Seq
 		if len(arc.Responses) > 0 {
 			// Fixed rule: a cancel that stopped work in progress is always
@@ -521,11 +504,9 @@ func (p *projector) projectResponse(message *AssistantMessage, arcStopped bool) 
 		}
 	}
 
-	// Reasoning describes the message the model actually produced, and a
-	// provider that takes it back validates it against what it is sent. A
-	// message that lost a call to a mode is no longer that message, so its
-	// reasoning is dropped rather than sent against a message it does not
-	// describe.
+	// A provider that takes reasoning back validates it against the message it
+	// is sent with. A message that lost a call to a mode is no longer that
+	// message, so its reasoning is dropped.
 	if len(assistant.ToolCalls) == len(message.ToolCalls) {
 		assistant.Reasoning = message.Reasoning
 	}
@@ -544,10 +525,8 @@ func (p *projector) projectResponse(message *AssistantMessage, arcStopped bool) 
 	}
 }
 
-// pendingStandIn says why a call has no result. The reasons are not
-// interchangeable and the model acts differently on each: one waits on a
-// machine, one waits on a person, one never ran and never will, and one was
-// handed to its tool and may have taken effect before everything stopped.
+// pendingStandIn says why a call has no result. The four reasons are not
+// interchangeable, since the model acts differently on each.
 //
 // arcStopped says the arc is over, so nothing further is coming.
 func pendingStandIn(call *ToolCall, arcStopped bool) string {
@@ -585,9 +564,8 @@ func (p *projector) projectErrors(arc *Arc) {
 // for. A refusal is not among them: it settled the call, so it reaches the
 // model as that call's result.
 //
-// Each note sits where its event happened. The ask and the decision can be far
-// apart, with other arcs' turns between them, which is why the decision names
-// the interrupt instead of relying on sitting next to the ask.
+// Each note sits where its event happened, and the two can be far apart, so
+// the decision names the interrupt rather than relying on position.
 func (p *projector) projectInterrupt(call *ToolCall) {
 	interrupt := call.Interrupt
 	if interrupt == nil || p.modes.Interrupt != TreatmentNote {
@@ -642,52 +620,57 @@ func arcEnd(arc *Arc) (int, bool) {
 	return 0, false
 }
 
+// taskLabel names a task in a note. The ID travels with the name because a
+// note is the only place the model learns it, and the tools that address a
+// task take an ID. It is written whole, since it is what the model hands
+// back.
+func taskLabel(task *AsyncTask) string {
+	return fmt.Sprintf("%s (id %s)", task.TaskName, task.ID)
+}
+
 func (p *projector) projectAsyncTasks(arc *Arc, stoppedSeq int, arcStopped bool) {
 	for _, task := range arc.AsyncTasks {
-		// Fixed rule: a task is always two notes, one at invocation and one at
-		// completion. Without the first the model cannot account for work it
-		// started, and without the second it waits for an answer that already
-		// arrived.
-		p.emitNote(task.Seq, 0, "[task %s started: %s]", task.TaskName, formatValue(task.Args))
+		// Fixed rule: a task is always two notes, one at invocation and one
+		// at completion.
+		p.emitNote(task.Seq, 0, "[task %s started: %s]", taskLabel(task), formatValue(task.Args))
 
 		for _, event := range task.Events {
 			switch event.Type {
 			case AsyncTaskEventNotification:
 				if p.modes.AsyncEvents == TreatmentNote {
-					p.emitNote(event.Seq, 0, "[task %s reported: %s]", task.TaskName, formatValue(event.Payload))
+					p.emitNote(event.Seq, 0, "[task %s reported: %s]", taskLabel(task), formatValue(event.Payload))
 				}
 			case AsyncTaskEventInputRequested:
 				if p.modes.AsyncInput == TreatmentNote {
-					p.emitNote(event.Seq, 0, "[task %s is waiting for input: %s]", task.TaskName, resultText(event.Payload))
+					p.emitNote(event.Seq, 0, "[task %s is waiting for input: %s]", taskLabel(task), resultText(event.Payload))
 				}
 			case AsyncTaskEventInputProvided:
 				if p.modes.AsyncInput == TreatmentNote {
-					p.emitNote(event.Seq, 0, "[task %s was given input: %s]", task.TaskName, resultText(event.Payload))
+					p.emitNote(event.Seq, 0, "[task %s was given input: %s]", taskLabel(task), resultText(event.Payload))
 				}
 			}
 		}
 
 		if task.FinishedSeq == nil {
-			// A task always gets its second note. An arc that is over is not
-			// going to produce one from a result, so the note says the one
-			// thing the log knows: the task was running and nobody reported
-			// what became of it.
+			// A task always gets its second note. An arc that is over will
+			// produce no result, so the note says what the log knows: the
+			// task was running and nobody reported what became of it.
 			if arcStopped {
 				// The note belongs where the arc ended, which is after
 				// everything the task managed to report.
 				p.emitNote(stoppedSeq, 1,
 					"[task %s was still running when this request was stopped. Whether it finished is not known.]",
-					task.TaskName)
+					taskLabel(task))
 			}
 			continue
 		}
 		switch task.Status {
 		case AsyncTaskFailed:
-			p.emitNote(*task.FinishedSeq, 1, "[task %s failed: %s]", task.TaskName, resultText(task.Result))
+			p.emitNote(*task.FinishedSeq, 1, "[task %s failed: %s]", taskLabel(task), resultText(task.Result))
 		case AsyncTaskCancelled:
-			p.emitNote(*task.FinishedSeq, 1, "[task %s was cancelled before it finished]", task.TaskName)
+			p.emitNote(*task.FinishedSeq, 1, "[task %s was cancelled before it finished]", taskLabel(task))
 		default:
-			p.emitNote(*task.FinishedSeq, 1, "[task %s finished: %s]", task.TaskName, resultText(task.Result))
+			p.emitNote(*task.FinishedSeq, 1, "[task %s finished: %s]", taskLabel(task), resultText(task.Result))
 		}
 	}
 }
@@ -752,9 +735,8 @@ func modelToolCall(call *ToolCall) ModelToolCall {
 // reported, because a failure the model is not told about is a failure it
 // repeats.
 //
-// A call that never ran says who stopped it. A policy is a rule to work
-// within, a human is someone to go back to, and a cancel is neither, so the
-// three cannot be left to read alike.
+// A call that never ran says who stopped it, since a policy, a human and a
+// cancel are three different things to the model.
 func toolResult(call *ToolCall) ModelToolMessage {
 	message := ModelToolMessage{
 		ToolCallID: call.ID,

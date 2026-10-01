@@ -83,9 +83,9 @@ type model struct {
 	// to be to hand before the run has written anything to read it from.
 	arc string
 
-	// reports is where a task's news goes. It is held so the interface can
-	// come back to an arc whose report arrived while something else held it.
-	reports *agent.TaskReports
+	// worker is how an arc is run. It is held so the interface can come back
+	// to an arc whose report arrived while something else held it.
+	worker *agent.ArcWorker
 
 	// owed are arcs a task reported on while they were busy. A report is in
 	// the log either way; what is missing is the turn it should have got.
@@ -96,7 +96,7 @@ type model struct {
 	ready  bool
 }
 
-func newModel(s *session, sender *sender, llm *agent.OpenAI, existing *transcript, reports *agent.TaskReports) model {
+func newModel(s *session, sender *sender, llm *agent.OpenAI, existing *transcript, worker *agent.ArcWorker) model {
 	input := textarea.New()
 	input.Placeholder = "Ask about the cluster…"
 	input.ShowLineNumbers = false
@@ -113,7 +113,7 @@ func newModel(s *session, sender *sender, llm *agent.OpenAI, existing *transcrip
 		input:      input,
 		spinner:    spin,
 		llm:        llm,
-		reports:    reports,
+		worker:     worker,
 	}
 }
 
@@ -152,10 +152,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch {
 		case msg.err == nil:
 		case errors.Is(msg.err, context.Canceled), errors.Is(msg.err, agent.ErrCancelled):
-			// The cancel is already written down, so the screen only has to
-			// say the run is over rather than repeat it as a failure. A run
-			// the guard refused a write to reads the same way to whoever asked
-			// for it, and arrives as ErrCancelled instead.
+			// The cancel is already written down, so the screen only says the
+			// run is over. A run the guard refused a write to arrives as
+			// ErrCancelled and reads the same way.
 			m.transcript.note("stopped")
 		default:
 			m.transcript.fail(msg.err)
@@ -181,10 +180,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c":
-		// While a run is in flight, the interrupt belongs to the run: the
-		// agent stops where it is and the log keeps what it had written. It
-		// goes the same way as /cancel, since it is the same decision and the
-		// two must not leave the log in different states.
+		// While a run is in flight, the interrupt belongs to the run. It goes
+		// the same way as /cancel, since it is the same decision.
 		if m.running() {
 			return cancelTurn(m, "")
 		}
@@ -261,7 +258,7 @@ func (m model) owe(arcID string) (tea.Model, tea.Cmd) {
 // to. One at a time: the next is picked up when this run reports it is done,
 // which is also what keeps two runs off one arc from this side.
 func (m model) settleOwed() (tea.Model, tea.Cmd) {
-	if m.running() || len(m.owed) == 0 || m.reports == nil {
+	if m.running() || len(m.owed) == 0 || m.worker == nil {
 		return m, nil
 	}
 	arc := m.owed[0]
@@ -271,10 +268,10 @@ func (m model) settleOwed() (tea.Model, tea.Cmd) {
 	m.cancel = cancel
 	m.arc = arc
 
-	reports, sender := m.reports, m.sender
+	worker, sender := m.worker, m.sender
 	go func() {
 		defer cancel()
-		worked, err := reports.Work(ctx, arc)
+		worked, err := worker.Work(ctx, arc)
 		if err == nil && !worked {
 			// Still held by somebody. The turn is still owed.
 			sender.send(taskOwedMsg{arcID: arc})

@@ -115,8 +115,8 @@ func (l *logger) taskAnswer(arc, task, id, message string) {
 	l.add(id, arc, events.AsyncTaskInputProvidedEventType, events.AsyncTaskInputProvidedPayload{CausationID: task, Message: message})
 }
 
-func (l *logger) taskResult(arc, task string, result any, isError bool) {
-	l.add("result-"+task, arc, events.AsyncTaskResultEventType, events.AsyncTaskResultPayload{CausationID: task, Result: result, IsError: isError})
+func (l *logger) taskResult(arc, task string, result any, outcome events.AsyncTaskOutcome) {
+	l.add("result-"+task, arc, events.AsyncTaskResultEventType, events.AsyncTaskResultPayload{CausationID: task, Result: result, Outcome: outcome})
 }
 
 func (l *logger) history(t *testing.T) *History {
@@ -550,7 +550,7 @@ func TestAsyncEventsModeGovernsTaskNotifications(t *testing.T) {
 	log.assistant("u1", "r1.1", "started the audit")
 	log.task("u1", "a1.1", "auditor", nil)
 	log.taskEvent("u1", "a1.1", "ae1", "scanned 40 namespaces")
-	log.taskResult("u1", "a1.1", "no findings", false)
+	log.taskResult("u1", "a1.1", "no findings", events.AsyncTaskOutcomeSuccess)
 	log.assistant("u1", "r1.2", "audit clean")
 	log.closeArc("u1", "r1.2")
 	log.user("u2", "thanks")
@@ -1109,7 +1109,7 @@ func TestArcHoldingARunningTaskStaysOpen(t *testing.T) {
 		"n{}",
 		"n{}",
 		"u(meanwhile, describe node n1)")
-	wantNoteContaining(t, transcript, "task auditor started")
+	wantNoteContaining(t, transcript, "task auditor (id a1.1) started")
 	wantNoteContaining(t, transcript, "still being worked on")
 
 	if status := log.history(t).Arcs[0].Status(); status != ArcStatusPending {
@@ -1152,13 +1152,13 @@ func TestFailedTaskIsReportedAsFailed(t *testing.T) {
 	log.user("u1", "audit the cluster")
 	log.assistant("u1", "r1.1", "started the audit")
 	log.task("u1", "a1.1", "auditor", nil)
-	log.taskResult("u1", "a1.1", "the audit host was unreachable", true)
+	log.taskResult("u1", "a1.1", "the audit host was unreachable", events.AsyncTaskOutcomeFailed)
 	log.assistant("u1", "r1.2", "the audit did not run")
 	log.closeArc("u1", "r1.2")
 	log.user("u2", "thanks")
 
 	transcript := project(t, log, "u2", DefaultModes())
-	wantNoteContaining(t, transcript, "task auditor failed: the audit host was unreachable")
+	wantNoteContaining(t, transcript, "task auditor (id a1.1) failed: the audit host was unreachable")
 }
 
 func TestCancelledCallWithoutAReasonStillAnswersTheCall(t *testing.T) {
@@ -1645,7 +1645,7 @@ func TestATaskResultAfterACancelStillSettlesIt(t *testing.T) {
 	log.assistant("u1", "r1.1", "started the audit")
 	log.task("u1", "k1.1", "auditor", nil)
 	log.cancel("u1", "c1.1", nil)
-	log.taskResult("u1", "k1.1", "14 findings", false)
+	log.taskResult("u1", "k1.1", "14 findings", events.AsyncTaskOutcomeSuccess)
 	log.user("u2", "anything?")
 
 	task := log.history(t).Arcs[0].AsyncTasks[0]
@@ -1655,7 +1655,7 @@ func TestATaskResultAfterACancelStillSettlesIt(t *testing.T) {
 
 	// And the model is told what it found, rather than that it was stopped.
 	noted := project(t, log, "u2", DefaultModes())
-	wantNoteContaining(t, noted, "task auditor finished: 14 findings")
+	wantNoteContaining(t, noted, "task auditor (id k1.1) finished: 14 findings")
 	for _, text := range noteTexts(noted) {
 		if strings.Contains(text, "not known") {
 			t.Errorf("note = %q, want no uncertainty about a task that reported", text)
@@ -1678,8 +1678,65 @@ func TestAStoppedArcStillGivesATaskItsSecondNote(t *testing.T) {
 	if len(notes) < 2 {
 		t.Fatalf("notes = %q, want the task's start and its stop", notes)
 	}
-	if !strings.Contains(notes[0], "task auditor started") {
+	if !strings.Contains(notes[0], "task auditor (id k1.1) started") {
 		t.Errorf("first note = %q, want the task starting", notes[0])
 	}
 	wantNoteContaining(t, noted, "still running when this request was stopped")
+}
+
+// A runner is the only thing that can say a task was stopped, and until this
+// outcome existed it had no way to say it: the log carried an error flag, so a
+// task that was called off reached the model as one that went wrong.
+func TestARunnerReportingACancelSettlesTheTaskAsCancelled(t *testing.T) {
+	log := newLogger()
+	log.user("u1", "audit the cluster")
+	log.assistant("u1", "r1.1", "started the audit")
+	log.task("u1", "k1.1", "auditor", nil)
+	log.cancel("u1", "c1.1", nil)
+	log.taskResult("u1", "k1.1", "stopped on request", events.AsyncTaskOutcomeCancelled)
+	log.user("u2", "anything?")
+
+	task := log.history(t).Arcs[0].AsyncTasks[0]
+	if task.Status != AsyncTaskCancelled {
+		t.Fatalf("task is %s, want %s", task.Status, AsyncTaskCancelled)
+	}
+
+	noted := project(t, log, "u2", DefaultModes())
+	wantNoteContaining(t, noted, "task auditor (id k1.1) was cancelled before it finished")
+	for _, text := range noteTexts(noted) {
+		if strings.Contains(text, "failed") {
+			t.Errorf("note = %q, want a task that was stopped not to read as one that failed", text)
+		}
+	}
+}
+
+// The first report wins. A runner that acknowledged a stop and then finished
+// anyway does not get to overwrite what it already said.
+func TestALateResultDoesNotUndoACancelledTask(t *testing.T) {
+	log := newLogger()
+	log.user("u1", "audit the cluster")
+	log.assistant("u1", "r1.1", "started the audit")
+	log.task("u1", "k1.1", "auditor", nil)
+	log.taskResult("u1", "k1.1", "stopped on request", events.AsyncTaskOutcomeCancelled)
+	log.add("result-late", "u1", events.AsyncTaskResultEventType,
+		events.AsyncTaskResultPayload{CausationID: "k1.1", Result: "14 findings", Outcome: events.AsyncTaskOutcomeSuccess})
+
+	task := log.history(t).Arcs[0].AsyncTasks[0]
+	if task.Status != AsyncTaskCancelled || task.Result != "stopped on request" {
+		t.Errorf("task = %#v, want the outcome it was already settled with", task)
+	}
+}
+
+// The model answers a waiting task by naming it, and the note is the only
+// place it is ever told which task that is.
+func TestTaskNotesCarryTheIDTheModelAnswersWith(t *testing.T) {
+	log := newLogger()
+	log.user("u1", "audit the cluster")
+	log.assistant("u1", "r1.1", "started the audit")
+	log.task("u1", "k1.1", "auditor", nil)
+	log.taskAsk("u1", "k1.1", "q1", "which namespace?")
+	log.user("u2", "kube-system")
+
+	noted := project(t, log, "u2", DefaultModes())
+	wantNoteContaining(t, noted, "task auditor (id k1.1) is waiting for input: which namespace?")
 }

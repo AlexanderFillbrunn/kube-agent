@@ -70,7 +70,11 @@ func newHarness(t *testing.T, replies ...*agent.LLMResponse) *harness {
 	}
 
 	persistor := agent.StampIdentity(agent.GuardCancellation(store, store), path)
-	reports, err := agent.NewTaskReports(path, persistor, store, chat, agent.NewLocalLease())
+	worker, err := agent.NewArcWorker(path, persistor, store, chat, agent.NewLocalLease())
+	if err != nil {
+		t.Fatalf("NewArcWorker: %v", err)
+	}
+	reports, err := agent.NewTaskReports(worker)
 	if err != nil {
 		t.Fatalf("NewTaskReports: %v", err)
 	}
@@ -85,7 +89,7 @@ func newHarness(t *testing.T, replies ...*agent.LLMResponse) *harness {
 			id:         path,
 			store:      store,
 			persistor:  persistor,
-			agent:      chat,
+			worker:     worker,
 			actor:      users.Actor{UserID: "dev", TenantID: "dev"},
 			controller: runner,
 		},

@@ -1,9 +1,7 @@
 package history
 
 // FoldState indexes the records a folded history contains, keyed by the IDs
-// events refer to them by. Events name their target by ID rather than by
-// position, so the fold needs this to resolve a result, response or cancel back
-// to the record it belongs to without scanning the history.
+// events refer to them by, so the fold resolves a target without scanning.
 //
 // The maps hold the same pointers as the history, so updating a record through
 // FoldState updates the history with it.

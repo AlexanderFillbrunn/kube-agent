@@ -153,11 +153,8 @@ func renderTool(b *block, width int) string {
 }
 
 // renderHeader draws the bar across the top: what this is, what it is talking
-// to, and a badge for every task still running.
-//
-// The bar stays one line whatever it holds, because the viewport is sized
-// against its height and a bar that wrapped would push the conversation about
-// as tasks came and went.
+// to, and a badge for every task still running. It stays one line, because the
+// viewport is sized against its height.
 func renderHeader(modelName string, tasks []string, width int) string {
 	title := titleStyle.Render("kube-agent")
 	details := subtitleStyle.Render(modelName)
@@ -176,12 +173,10 @@ func renderHeader(modelName string, tasks []string, width int) string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, title, details, badges)
 }
 
-// namedBadges draws a badge per task, dropping them from the end until they fit
-// and counting off whatever was dropped. It is empty when not even one fits.
-//
-// They are dropped rather than cut short, because a badge is drawn with colour
-// codes around it and cutting one by character would slice through those and
-// leave the rest of the line wearing its background.
+// namedBadges draws a badge per task, dropping them from the end until they
+// fit and counting off whatever was dropped. It is empty when not even one
+// fits. Badges are dropped rather than cut short, since cutting one by
+// character would slice through its colour codes.
 func namedBadges(tasks []string, room int) string {
 	for count := len(tasks); count > 0; count-- {
 		badges := renderBadges(tasks[:count])

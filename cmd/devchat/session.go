@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 
 	"fillbrunn.ai/kube-agent/internal/filestore"
 	"fillbrunn.ai/kube-agent/pkg/agent"
@@ -22,19 +23,21 @@ type session struct {
 	// what it files is filed under this session, and it refuses work on an arc
 	// somebody has cancelled.
 	persistor agent.EventPersistor
-	agent     *agent.Agent
-	actor     users.Actor
+
+	// worker runs the arc, under the lease that keeps two runs off it. A
+	// person's turn acquires it like everything else that enters an arc.
+	worker *agent.ArcWorker
+
+	actor users.Actor
 
 	// controller reaches the tasks an arc started, so that stopping the arc
 	// stops them too. It is nil for a session with no tasks.
 	controller agent.TaskController
 }
 
-// newArcID mints the identifier for an arc about to be opened.
-//
-// The caller names the arc rather than learning its name afterwards, because
-// cancelling needs the ID while the run is still going and a run that has not
-// written anything yet has nothing to read it from.
+// newArcID mints the identifier for an arc about to be opened. The caller
+// names the arc up front, because cancelling needs the ID before the run has
+// written anything.
 func (s *session) newArcID() string { return filestore.NewID() }
 
 // turn opens an arc with what the user said and runs the agent to the end of
@@ -50,23 +53,24 @@ func (s *session) turn(ctx context.Context, arcID, message string) error {
 		return err
 	}
 
-	h, err := s.arcHistory(ctx, arcID)
+	worked, err := s.worker.Work(ctx, arcID)
 	if err != nil {
 		return err
 	}
-	return s.agent.Run(ctx, s.persistor, h, arcID)
+	if !worked {
+		// The message above opened this arc, so nothing can be holding it.
+		// Something that does means the ID was not as new as it looked.
+		return fmt.Errorf("arc %s is already being worked", arcID)
+	}
+	return nil
 }
 
-// cancel records that the user withdrew an arc.
+// cancel records that the user withdrew an arc. Writing it is the caller's
+// job, since only they can name the actor.
 //
-// Writing this is the caller's job rather than the agent's: whoever decided
-// the cancel is the one who can name the actor, and the agent stops without
-// ever writing a cancel of its own. Stopping the run is separate, and both are
-// needed — the record is what the log and the next turn's projection read, and
-// the context is what interrupts a tool that is already running.
-//
-// The context here is not the run's. That one is about to be cancelled, and a
-// cancelled context must not be the thing carrying the write that says so.
+// Stopping the run is separate and both are needed: the record is what the log
+// and the next projection read, and the context is what interrupts a running
+// tool. The context here is not the run's, which is about to be cancelled.
 func (s *session) cancel(ctx context.Context, arcID, reason string) error {
 	payload := events.CancelPayload{}
 	if reason != "" {
@@ -83,16 +87,11 @@ func (s *session) cancel(ctx context.Context, arcID, reason string) error {
 	return s.stopTasks(ctx, arcID, reason)
 }
 
-// stopTasks asks whatever the arc started to stop.
+// stopTasks asks whatever the arc started to stop. Which tasks those are is
+// read from the log, and nothing is written: what became of work already under
+// way is the runner's to report.
 //
-// Which tasks those are is a question for the log, which is why nothing here
-// keeps a list: the arc holds its tasks and an unfinished one is one worth
-// asking about. Nothing is written. A cancel ends the waiting, and what became
-// of work already under way is the runner's to report.
-//
-// A task that cannot be reached is not worth failing the cancel over. The
-// cancel is recorded, the arc is stopped, and a task nobody can reach is one
-// the log already cannot account for.
+// A task that cannot be reached does not fail the cancel.
 func (s *session) stopTasks(ctx context.Context, arcID, reason string) error {
 	if s.controller == nil {
 		return nil
