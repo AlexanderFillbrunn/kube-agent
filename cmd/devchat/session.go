@@ -12,8 +12,8 @@ import (
 )
 
 // session is one conversation against one log. It knows nothing about the
-// screen: what a run produces reaches the interface through the sinks the
-// agent was built with.
+// screen: what it writes reaches the interface through the sink the persistor
+// publishes to.
 type session struct {
 	// id names the session in the records it writes. The log's path serves,
 	// since a session and its file are the same thing here.
@@ -40,10 +40,18 @@ type session struct {
 // written anything.
 func (s *session) newArcID() string { return filestore.NewID() }
 
+// ref addresses one of this session's arcs. Everything that stores, locks or
+// routes by arc is told the session too, since nothing outside this harness
+// can assume there is only one.
+func (s *session) ref(arcID string) agent.ArcRef {
+	return agent.ArcRef{SessionID: s.id, ArcID: arcID}
+}
+
 // turn opens an arc with what the user said and runs the agent to the end of
 // it.
 func (s *session) turn(ctx context.Context, arcID, message string) error {
 	opening := &events.Event{
+		SessionID:     s.id,
 		Typ:           events.UserMessageEventType,
 		CorrelationID: &arcID,
 		Actor:         s.actor,
@@ -53,7 +61,7 @@ func (s *session) turn(ctx context.Context, arcID, message string) error {
 		return err
 	}
 
-	worked, err := s.worker.Work(ctx, arcID)
+	worked, err := s.worker.Work(ctx, s.ref(arcID))
 	if err != nil {
 		return err
 	}
@@ -77,6 +85,7 @@ func (s *session) cancel(ctx context.Context, arcID, reason string) error {
 		payload.Reason = &reason
 	}
 	if _, err := s.persistor.Persist(ctx, &events.Event{
+		SessionID:     s.id,
 		Typ:           events.CancelEventType,
 		CorrelationID: &arcID,
 		Actor:         s.actor,
@@ -108,7 +117,7 @@ func (s *session) stopTasks(ctx context.Context, arcID, reason string) error {
 			if task.FinishedSeq != nil {
 				continue
 			}
-			ref := agent.TaskRef{ArcID: arc.ID, ID: task.ID, Name: task.TaskName}
+			ref := agent.TaskRef{ArcRef: s.ref(arc.ID), ID: task.ID, Name: task.TaskName}
 			_ = s.controller.Cancel(ctx, ref, reason)
 		}
 	}
@@ -117,7 +126,7 @@ func (s *session) stopTasks(ctx context.Context, arcID, reason string) error {
 
 // arcHistory loads and folds the events one arc is run from.
 func (s *session) arcHistory(ctx context.Context, arcID string) (*history.History, error) {
-	stored, err := s.store.GetEventsForArc(ctx, arcID)
+	stored, err := s.store.GetEventsForArc(ctx, s.ref(arcID))
 	if err != nil {
 		return nil, err
 	}

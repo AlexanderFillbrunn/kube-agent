@@ -24,7 +24,6 @@ import (
 
 	"fillbrunn.ai/kube-agent/internal/filestore"
 	"fillbrunn.ai/kube-agent/pkg/agent"
-	"fillbrunn.ai/kube-agent/pkg/events"
 	"fillbrunn.ai/kube-agent/pkg/users"
 )
 
@@ -84,20 +83,8 @@ func run(storePath, modelName, baseURL, systemPrompt, userID string) error {
 	// the program once there is one.
 	relay := &sender{}
 	chat, err := agent.NewAgent(
-		&agent.AgentConfig{
-			SystemPrompt: systemPrompt,
-			Tokens: agent.SinkFromFunc(func(token string) error {
-				relay.send(tokenMsg(token))
-				return nil
-			}),
-			Observer: agent.SinkFromFunc(func(ev *events.Event) error {
-				relay.send(eventMsg{event: ev})
-				return nil
-			}),
-		},
+		&agent.AgentConfig{SystemPrompt: systemPrompt},
 		registry,
-		// The guard turns a cancel recorded in the log into a run that stops,
-		// wherever the cancel was recorded.
 		llm,
 		agent.WithTasks(tasks, runner),
 	)
@@ -105,10 +92,20 @@ func run(storePath, modelName, baseURL, systemPrompt, userID string) error {
 		return err
 	}
 
-	persistor := agent.StampIdentity(agent.GuardCancellation(store, store), storePath)
-	// One worker for the session, so that a person's turn, a task's report
-	// and anything else that enters an arc contend for the same lease.
-	worker, err := agent.NewArcWorker(storePath, persistor, store, chat, agent.NewLocalLease())
+	// Notification hangs off the persistor rather than the agent, so
+	// everything written reaches the screen: the user's own message and a
+	// cancel as much as what a run records. The guard turns a cancel recorded
+	// in the log into a run that stops, wherever the cancel was recorded.
+	persistor := agent.PublishEvents(
+		agent.MintIdentity(agent.GuardCancellation(store, store)),
+		screenEvents{relay: relay},
+	)
+
+	// One worker for the process, so that a person's turn, a task's report
+	// and anything else that enters an arc contend for the same lease. The
+	// session arrives with the arc rather than being built in.
+	worker, err := agent.NewArcWorker(persistor, store, chat, agent.NewLocalLease(),
+		agent.WithTokenSink(screenTokens{relay: relay}))
 	if err != nil {
 		return err
 	}
@@ -130,9 +127,7 @@ func run(storePath, modelName, baseURL, systemPrompt, userID string) error {
 		return err
 	}
 	runner.attach(reports,
-		func(ref agent.TaskRef, text string, state toolState) {
-			relay.send(taskMsg{ref: ref, text: text, state: state})
-		},
+		func(ref agent.TaskRef, err error) { relay.send(taskUnfiledMsg{ref: ref, err: err}) },
 		func(arcID string) { relay.send(taskOwedMsg{arcID: arcID}) },
 	)
 

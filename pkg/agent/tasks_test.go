@@ -217,7 +217,7 @@ func runCallInArc(t *testing.T, h *history.History, arcID string, tasks *TaskReg
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
-	if err := agent.Run(context.Background(), persistor, h, arcID); err != nil {
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: arcID}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	return persistor

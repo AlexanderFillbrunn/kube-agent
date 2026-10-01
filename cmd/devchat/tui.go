@@ -26,19 +26,37 @@ type (
 	eventMsg    struct{ event *events.Event }
 	turnDoneMsg struct{ err error }
 
-	// taskMsg is a running task saying something. It reaches the screen from
-	// the task itself rather than through the log, because what the log holds
-	// is written by the ingress on a goroutine of its own.
-	taskMsg struct {
-		ref   agent.TaskRef
-		text  string
-		state toolState
+	// taskUnfiledMsg is a report a task could not get written at all. It comes
+	// from the task rather than the log for the one reason the log cannot
+	// carry it: there is nothing in the log to carry.
+	taskUnfiledMsg struct {
+		ref agent.TaskRef
+		err error
 	}
 
 	// taskOwedMsg says a task's report did not get its arc a turn, because
 	// something else held the arc. The arc is owed a run once that is over.
 	taskOwedMsg struct{ arcID string }
 )
+
+// screenEvents is the event sink the persistor publishes to. Everything that
+// is written reaches the screen this way, whoever wrote it, which is why the
+// agent needs no notion of an interface.
+type screenEvents struct{ relay *sender }
+
+func (s screenEvents) Consume(_ context.Context, evs ...*events.Event) {
+	for _, ev := range evs {
+		s.relay.send(eventMsg{event: ev})
+	}
+}
+
+// screenTokens is the token sink the worker streams replies to. The session
+// and the arc are dropped here, since this harness only ever shows one.
+type screenTokens struct{ relay *sender }
+
+func (t screenTokens) Token(_ context.Context, tok agent.StreamToken) {
+	t.relay.send(tokenMsg(tok.Content))
+}
 
 // sender hands messages to the program. It exists because the sinks have to be
 // built before the program they report to: the model is passed to NewProgram,
@@ -139,8 +157,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.transcript.event(msg.event)
 		return m.refresh(), nil
 
-	case taskMsg:
-		m.transcript.taskSaid(msg.ref.ID, msg.ref.Name, msg.text, msg.state)
+	case taskUnfiledMsg:
+		m.transcript.taskSaid(msg.ref.ID, msg.ref.Name,
+			fmt.Sprintf("could not be filed: %v", msg.err), toolFailed)
 		return m.refresh(), nil
 
 	case taskOwedMsg:
@@ -235,13 +254,9 @@ func (m model) start(message string) (tea.Model, tea.Cmd) {
 		sender.send(turnDoneMsg{err: session.turn(ctx, arc, message)})
 	}()
 
-	// The user's own message is shown without waiting for the log, so that
-	// pressing enter does something immediately.
-	m.transcript.blocks = append(m.transcript.blocks, &block{
-		kind:   blockUser,
-		author: m.session.actor.UserID,
-		text:   message,
-	})
+	// Nothing is put on the screen here. The message is written to the log
+	// before anything else happens, and the persistor publishes it straight
+	// back, so showing it as well would show it twice.
 	return m.refresh(), m.spinner.Tick
 }
 
@@ -268,10 +283,10 @@ func (m model) settleOwed() (tea.Model, tea.Cmd) {
 	m.cancel = cancel
 	m.arc = arc
 
-	worker, sender := m.worker, m.sender
+	worker, sender, session := m.worker, m.sender, m.session
 	go func() {
 		defer cancel()
-		worked, err := worker.Work(ctx, arc)
+		worked, err := worker.Work(ctx, session.ref(arc))
 		if err == nil && !worked {
 			// Still held by somebody. The turn is still owed.
 			sender.send(taskOwedMsg{arcID: arc})

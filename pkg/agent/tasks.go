@@ -23,9 +23,11 @@ const (
 // TaskRef names one running task well enough to reach it from outside this
 // process. ID alone is the task's identity, and the rest is addressing.
 type TaskRef struct {
-	// ArcID is the arc that owns the task. It is a routing hint: a report
-	// quoting an arc that does not own the task named is rejected.
-	ArcID string
+	// ArcRef is the arc that owns the task, and the session that arc is in. A
+	// report quoting an arc that does not own the task named is rejected, and
+	// a report arriving from another process has no other way to say which log
+	// to write it to.
+	ArcRef
 
 	// ID identifies the task in the log.
 	ID string

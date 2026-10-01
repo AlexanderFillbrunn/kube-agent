@@ -6,6 +6,11 @@ Status
 Half built. The lease and the worker are in `pkg/agent/arcwork.go`. The queue
 that drives them is a proposal, and nothing implements it.
 
+An arc is named by an `ArcRef`: a session and an arc ID together. A worker
+claiming arcs off a shared queue has no other way to learn whose session it is
+replaying, so everything below carries the ref rather than the ID. See
+[EVENT-SINK.md](EVENT-SINK.md).
+
 An arc is opened once and worked more than once. This document covers the
 second part: who may run an arc that already exists, how two runs are kept off
 one, and how the work of running one reaches a worker.
@@ -76,7 +81,7 @@ replayed too early, so it releases the item rather than settling it.
 *A worker never waits on a held arc.* Waiting blocks a worker on one arc while
 others go unserved, and the waiters are redundant with each other.
 
-Partitioning by arc ID is worth it where the transport offers it, with SQS FIFO
+Partitioning by arc is worth it where the transport offers it, with SQS FIFO
 `MessageGroupId` as the closest fit. It serializes an arc's items at delivery,
 which turns the release path from the common case into the recovery case. It
 does not replace the lease. A visibility timeout expires because a run is slow,
@@ -90,7 +95,7 @@ keeps `Claim` out of reach of the interfaces that call `Decide`.
 
     // ArcQueue is where an arc is put when it needs a run.
     type ArcQueue interface {
-        Enqueue(ctx context.Context, arcID string) error
+        Enqueue(ctx context.Context, ref ArcRef) error
     }
 
     // ArcClaims hands out arcs that need a run, one at a time.
@@ -101,7 +106,7 @@ keeps `Claim` out of reach of the interfaces that call `Decide`.
     // Claim is one arc taken off the queue and held until it is settled. A
     // claim nobody settles comes back.
     type Claim interface {
-        ArcID() string
+        Ref() ArcRef
 
         // Attempt counts how often this arc was handed out and given back. A
         // backoff is computed from it, so the policy stays with the worker.
@@ -118,9 +123,13 @@ keeps `Claim` out of reach of the interfaces that call `Decide`.
 `Enqueue` takes no delay. The only delay the design needs is on the retry path,
 and that lives on the claim.
 
-`ArcLease` does not change and does not merge into the queue. A person's turn
-enters through `Agent.Run` and an in-process task through `Report`, and neither
-passes the queue.
+`ArcLease` does not merge into the queue. A person's turn enters through
+`Agent.Run` and an in-process task through `Report`, and neither passes the
+queue. It keys on the same `ArcRef`, and its `Acquire` takes a context and can
+fail: a lock service that cannot be reached is a different answer from an arc
+somebody else holds, and a caller that confused the two would run the arc
+twice. What it still cannot do is expire a lease or fence a writer that lost
+one. Both need a store that can refuse a write.
 The worker loop
 --------------------
 One loop holds the release rule for every transport.
@@ -130,7 +139,7 @@ One loop holds the release rule for every transport.
         if err != nil {
             return err
         }
-        worked, err := w.Work(ctx, claim.ArcID())
+        worked, err := w.Work(ctx, claim.Ref())
         switch {
         case err != nil:
             // The arc was not replayed. Settling the claim would spend a

@@ -3,93 +3,200 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 
 	"fillbrunn.ai/kube-agent/pkg/events"
 	"fillbrunn.ai/kube-agent/pkg/history"
 )
 
+// ArcRef names one arc well enough to find it from any process. An arc ID is
+// unique on its own, but nothing that stores, locks or routes by arc can be
+// partitioned by session without being told the session as well, and a worker
+// claiming arcs off a shared queue has no other way to learn it.
+type ArcRef struct {
+	SessionID string
+	ArcID     string
+}
+
+func (r ArcRef) String() string { return r.SessionID + "/" + r.ArcID }
+
 // ArcLease keeps two runs off one arc.
 type ArcLease interface {
-	// Acquire takes the arc. It returns false when the arc is already held.
-	Acquire(arcID string) (release func(), ok bool)
+	// Acquire takes the arc. ok is false when somebody else holds it, which
+	// is not a failure: the caller leaves the arc to them and the arc is owed
+	// a run.
+	//
+	// An error means the lease could not be reached, and the caller learns
+	// nothing about who holds the arc. The two have to be told apart, since a
+	// caller that read an unreachable lock service as "nobody holds it" would
+	// run the arc twice.
+	//
+	// Nothing here expires a lease or fences a writer. A holder that dies
+	// holds the arc until whatever granted it decides otherwise, and a holder
+	// whose lease expired goes on writing, because EventPersistor has no way
+	// to say what the writer expected the log to look like.
+	Acquire(ctx context.Context, ref ArcRef) (release func(), ok bool, err error)
 }
 
 // LocalLease is an ArcLease for one process.
 type LocalLease struct {
 	mu   sync.Mutex
-	held map[string]bool
+	held map[ArcRef]bool
 }
 
-func NewLocalLease() *LocalLease { return &LocalLease{held: map[string]bool{}} }
+func NewLocalLease() *LocalLease { return &LocalLease{held: map[ArcRef]bool{}} }
 
-func (l *LocalLease) Acquire(arcID string) (func(), bool) {
+// Acquire never returns an error: what it consults is in this process.
+func (l *LocalLease) Acquire(_ context.Context, ref ArcRef) (func(), bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.held[arcID] {
-		return nil, false
-	}
 	if l.held == nil {
-		l.held = map[string]bool{}
+		l.held = map[ArcRef]bool{}
 	}
-	l.held[arcID] = true
+	if l.held[ref] {
+		return nil, false, nil
+	}
+	l.held[ref] = true
 
 	return func() {
 		l.mu.Lock()
 		defer l.mu.Unlock()
-		delete(l.held, arcID)
-	}, true
+		delete(l.held, ref)
+	}, true, nil
+}
+
+// StreamToken is one piece of a reply as the model writes it, addressed well
+// enough to route from another process.
+type StreamToken struct {
+	SessionID string
+	ArcID     string
+
+	// MessageID is the assistant message that will record this reply. It is
+	// minted before the model is called, so the tokens can name it.
+	MessageID string
+
+	Content string
+}
+
+// TokenSink takes a reply as it is written.
+//
+// Like EventSink it returns nothing, so a watcher cannot fail a run, and it
+// must return promptly: it is called from inside the model's stream.
+//
+// A token is not a record. It is lost on a dropped connection and never
+// replayed, because the ASSISTANT_MESSAGE event behind it carries the same
+// text and is in the log. So a subscriber treats streamed text as provisional:
+// it replaces it with the recorded content when that event arrives, and
+// discards it for an arc that ends without one.
+type TokenSink interface {
+	Token(ctx context.Context, tok StreamToken)
 }
 
 // ArcWorker runs the agent over an arc that already exists, under the lease
 // that keeps two runs off it. Every way into an arc shares one worker, because
 // the lease only excludes callers that acquire the same one.
+//
+// It holds nothing belonging to one session. The session arrives with the arc,
+// so one worker serves a whole tier.
 type ArcWorker struct {
-	sessionID string
 	persistor EventPersistor
 	source    EventSource
 	agent     *Agent
 	lease     ArcLease
+
+	// tokens follows a reply as it is written, and is nil for a worker nobody
+	// is watching, which is every worker with no interface attached.
+	tokens TokenSink
+}
+
+// ArcWorkerOption configures parts of a worker that not every worker has.
+type ArcWorkerOption func(*ArcWorker)
+
+// WithTokenSink gives a worker somewhere to stream replies as they arrive.
+func WithTokenSink(tokens TokenSink) ArcWorkerOption {
+	return func(w *ArcWorker) { w.tokens = tokens }
 }
 
 // NewArcWorker builds a worker from the parts a run is made of. A nil lease
 // becomes a LocalLease.
-func NewArcWorker(sessionID string, persistor EventPersistor, source EventSource, agent *Agent, lease ArcLease) (*ArcWorker, error) {
+func NewArcWorker(persistor EventPersistor, source EventSource, agent *Agent, lease ArcLease, options ...ArcWorkerOption) (*ArcWorker, error) {
 	if persistor == nil || source == nil || agent == nil {
 		return nil, errors.New("an arc worker needs a persistor, a source and an agent")
 	}
 	if lease == nil {
 		lease = NewLocalLease()
 	}
-	return &ArcWorker{sessionID: sessionID, persistor: persistor, source: source, agent: agent, lease: lease}, nil
+	worker := &ArcWorker{persistor: persistor, source: source, agent: agent, lease: lease}
+	for _, option := range options {
+		option(worker)
+	}
+	return worker, nil
 }
 
 // Work replays an arc from the log and runs the agent over it. It returns
 // false without running when another caller holds the arc, which leaves that
 // arc owed a run.
-func (w *ArcWorker) Work(ctx context.Context, arcID string) (bool, error) {
-	release, ok := w.lease.Acquire(arcID)
+func (w *ArcWorker) Work(ctx context.Context, ref ArcRef) (bool, error) {
+	release, ok, err := w.lease.Acquire(ctx, ref)
+	if err != nil {
+		return false, fmt.Errorf("could not take the lease on arc %s: %w", ref, err)
+	}
 	if !ok {
 		return false, nil
 	}
 	defer release()
 
-	h, err := w.arcHistory(ctx, arcID)
+	h, err := w.arcHistory(ctx, ref)
 	if err != nil {
 		return false, err
 	}
-	return true, w.agent.Run(ctx, w.persistor, h, arcID)
+	return true, w.agent.Run(ctx, RunOptions{
+		Persistor: w.persistor,
+		History:   h,
+		ArcID:     ref.ArcID,
+		Tokens:    w.tokenSink(ctx, ref),
+	})
+}
+
+// tokenSink labels what the agent streams with the arc it is streaming for.
+// The agent knows the message, the worker knows the arc, and neither knows
+// where the text ends up.
+//
+// It is nil for a worker nobody is watching, which is what stops the agent
+// paying for a sink that discards.
+func (w *ArcWorker) tokenSink(ctx context.Context, ref ArcRef) Sink[Token] {
+	if w.tokens == nil {
+		return nil
+	}
+	sink := w.tokens
+	return SinkFromFunc(func(tok Token) error {
+		sink.Token(ctx, StreamToken{
+			SessionID: ref.SessionID,
+			ArcID:     ref.ArcID,
+			MessageID: tok.MessageID,
+			Content:   tok.Content,
+		})
+		return nil
+	})
 }
 
 // arcHistory loads and folds the events one arc is run from.
-func (w *ArcWorker) arcHistory(ctx context.Context, arcID string) (*history.History, error) {
-	stored, err := w.source.GetEventsForArc(ctx, arcID)
+func (w *ArcWorker) arcHistory(ctx context.Context, ref ArcRef) (*history.History, error) {
+	stored, err := w.source.GetEventsForArc(ctx, ref)
 	if err != nil {
 		return nil, err
 	}
 	folded := make([]events.Event, 0, len(stored))
 	for _, ev := range stored {
+		// A ref naming the wrong session would replay one session's arc under
+		// another's name, and every event the run went on to write would be
+		// filed there. The events say which session they are in, so the ref
+		// is checked against them rather than trusted.
+		if ev.SessionID != ref.SessionID {
+			return nil, fmt.Errorf("event %s is in session %s, not %s", ev.ID, ev.SessionID, ref.SessionID)
+		}
 		folded = append(folded, *ev)
 	}
-	return history.Replay(w.sessionID, folded)
+	return history.Replay(ref.SessionID, folded)
 }

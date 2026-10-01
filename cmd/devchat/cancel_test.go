@@ -31,14 +31,14 @@ func runningModel(t *testing.T, arc string) (model, context.Context, *filestore.
 	s := &session{
 		id:        "session",
 		store:     store,
-		persistor: agent.StampIdentity(agent.GuardCancellation(store, store), "session"),
+		persistor: agent.MintIdentity(agent.GuardCancellation(store, store)),
 		actor:     actor,
 	}
 
 	// The arc has to be opened before it can be withdrawn: a cancel naming an
 	// arc the fold never saw is an error, not a cancel.
 	if _, err := s.persistor.Persist(context.Background(), &events.Event{
-		Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
+		SessionID: s.id, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
 		Payload: events.UserMessagePayload{Content: "what is pending?", Actor: actor},
 	}); err != nil {
 		t.Fatalf("Persist: %v", err)

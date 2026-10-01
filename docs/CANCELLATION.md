@@ -40,7 +40,11 @@ Each one may fail without making the record wrong.
 The guard
 --------------------
 `GuardCancellation` wraps the worker's persistor and refuses writes that start
-work, reporting `ErrCancelled`. Only two events start work.
+work, reporting `ErrCancelled`. It reads the cancel afresh on every guarded
+write and remembers nothing: it used to cache the arcs it had refused, which
+raced between the runs sharing one persistor and saved about one read, since a
+refusal ends the run at the first dispatch it reaches. Only two events start
+work.
 
     TOOL_DISPATCHED      written immediately before a tool runs
     ASYNC_TASK_INVOKE    written immediately before a task is started
@@ -84,14 +88,14 @@ announces, the worker watches, and nothing holds both.
     // CancelNotifier tells watchers that an arc has been cancelled. It is
     // best effort: a failure here does not fail the cancel.
     type CancelNotifier interface {
-        NotifyCancel(ctx context.Context, arcID string) error
+        NotifyCancel(ctx context.Context, ref ArcRef) error
     }
 
     // CancelWatcher reports that an arc has been cancelled, as soon as it can.
     type CancelWatcher interface {
         // Watch returns a channel closed when the arc is cancelled. The
         // caller calls stop when it is done with the arc.
-        Watch(ctx context.Context, arcID string) (cancelled <-chan struct{}, stop func())
+        Watch(ctx context.Context, ref ArcRef) (cancelled <-chan struct{}, stop func())
     }
 
 A channel rather than a derived context, so the context plumbing lives once in
@@ -100,9 +104,9 @@ A channel rather than a derived context, so the context plumbing lives once in
 It hooks in `Work`, which is the one place every way into an arc passes and
 the only place that holds the run's context.
 
-    release, ok := w.lease.Acquire(arcID)
+    release, ok, err := w.lease.Acquire(ctx, ref)
     ...
-    cancelled, stop := w.cancels.Watch(ctx, arcID)
+    cancelled, stop := w.cancels.Watch(ctx, ref)
     defer stop()
     ctx, abort := context.WithCancel(ctx)
     defer abort()
@@ -114,7 +118,7 @@ the only place that holds the run's context.
         }
     }()
 
-    h, err := w.arcHistory(ctx, arcID)
+    h, err := w.arcHistory(ctx, ref)
 
 The subscribe comes before the replay. A cancel written before the subscribe
 is in what the replay reads, and one written after it is delivered. Subscribing
@@ -122,7 +126,7 @@ afterwards leaves a window where a cancel is published to nobody. That window
 costs latency rather than correctness, because of the guard, which is the
 reason the two mechanisms are worth keeping apart.
 
-In one process, `Watch` is a map of arc ID to channels and `NotifyCancel`
+In one process, `Watch` is a map of `ArcRef` to channels and `NotifyCancel`
 closes them. Across processes it is a subscription per arc, or one pattern
 subscription fanned out inside the implementation where a worker holds many
 arcs at once.

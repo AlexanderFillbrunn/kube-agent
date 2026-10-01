@@ -70,21 +70,12 @@ func TestTurnWritesAWholeArc(t *testing.T) {
 	}
 
 	// The harness follows a run through these two sinks, so the test watches
-	// the same way the interface does.
+	// the same way the interface does: events off the persistor, tokens off
+	// the worker.
 	shown := newTranscript()
 	var tokens strings.Builder
 	chat, err := agent.NewAgent(
-		&agent.AgentConfig{
-			SystemPrompt: "be terse",
-			Tokens: agent.SinkFromFunc(func(token string) error {
-				tokens.WriteString(token)
-				return nil
-			}),
-			Observer: agent.SinkFromFunc(func(ev *events.Event) error {
-				shown.event(ev)
-				return nil
-			}),
-		},
+		&agent.AgentConfig{SystemPrompt: "be terse"},
 		registry,
 		agent.NewOpenAI("test-key", "gpt-5", agent.WithBaseURL(model.URL)),
 	)
@@ -92,8 +83,9 @@ func TestTurnWritesAWholeArc(t *testing.T) {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
-	persistor := agent.StampIdentity(store, "session")
-	worker, err := agent.NewArcWorker("session", persistor, store, chat, nil)
+	persistor := agent.PublishEvents(agent.MintIdentity(store), captureEvents{shown: shown})
+	worker, err := agent.NewArcWorker(persistor, store, chat, nil,
+		agent.WithTokenSink(captureTokens{text: &tokens}))
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
@@ -214,8 +206,8 @@ func TestSecondTurnReplaysTheFirst(t *testing.T) {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
-	persistor := agent.StampIdentity(store, "session")
-	worker, err := agent.NewArcWorker("session", persistor, store, chat, nil)
+	persistor := agent.MintIdentity(store)
+	worker, err := agent.NewArcWorker(persistor, store, chat, nil)
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
@@ -242,6 +234,23 @@ func TestSecondTurnReplaysTheFirst(t *testing.T) {
 	if !strings.Contains(sent, "and now?") {
 		t.Errorf("the second turn did not carry its own question: %s", sent)
 	}
+}
+
+// captureEvents folds what was published into a transcript, the way the
+// interface does.
+type captureEvents struct{ shown *transcript }
+
+func (c captureEvents) Consume(_ context.Context, evs ...*events.Event) {
+	for _, ev := range evs {
+		c.shown.event(ev)
+	}
+}
+
+// captureTokens collects a reply as it streams.
+type captureTokens struct{ text *strings.Builder }
+
+func (c captureTokens) Token(_ context.Context, tok agent.StreamToken) {
+	c.text.WriteString(tok.Content)
 }
 
 func typesOf(stored []*events.Event) string {

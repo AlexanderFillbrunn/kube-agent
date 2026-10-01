@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"fillbrunn.ai/kube-agent/pkg/agent"
 	"fillbrunn.ai/kube-agent/pkg/events"
 )
 
@@ -107,7 +108,7 @@ func (s *Store) Close() error {
 // position in the log.
 //
 // An ID and a timestamp are filled in only where the caller left them empty,
-// which a caller writing through agent.StampIdentity never does.
+// which a caller writing through agent.MintIdentity never does.
 //
 // A batch is one write and one sync, and the sequence number only advances
 // once it is on disk. That is as close to atomic as a file gets: a write that
@@ -163,13 +164,16 @@ func (s *Store) Events(_ context.Context) ([]*events.Event, error) {
 	return pointers(readFile(s.path))
 }
 
-// GetEventsForArc returns the events one arc is projected from: everything up
-// to and including the user message that opened it, plus everything correlated
-// to it afterwards.
+// GetEventsForArc returns the events one arc is projected from: everything in
+// its session up to and including the user message that opened it, plus
+// everything correlated to it afterwards.
 //
 // That query is the projection's cutoff. A store that returned more, or less,
 // would change what the model is told. See PROJECTION.md.
-func (s *Store) GetEventsForArc(_ context.Context, arcID string) ([]*events.Event, error) {
+//
+// A file holds one session, so the session in the ref only ever rules events
+// out here. A store that held more than one would partition on it.
+func (s *Store) GetEventsForArc(_ context.Context, ref agent.ArcRef) ([]*events.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -180,18 +184,21 @@ func (s *Store) GetEventsForArc(_ context.Context, arcID string) ([]*events.Even
 
 	opening := -1
 	for i := range all {
-		if all[i].Typ == events.UserMessageEventType && correlatesTo(&all[i], arcID) {
+		if all[i].Typ == events.UserMessageEventType && belongsTo(&all[i], ref) {
 			opening = all[i].Seq
 			break
 		}
 	}
 	if opening < 0 {
-		return nil, fmt.Errorf("no arc %s in %s", arcID, s.path)
+		return nil, fmt.Errorf("no arc %s in %s", ref, s.path)
 	}
 
 	var selected []*events.Event
 	for i := range all {
-		if all[i].Seq <= opening || correlatesTo(&all[i], arcID) {
+		if all[i].SessionID != ref.SessionID {
+			continue
+		}
+		if all[i].Seq <= opening || correlatesTo(&all[i], ref.ArcID) {
 			selected = append(selected, &all[i])
 		}
 	}
@@ -200,7 +207,7 @@ func (s *Store) GetEventsForArc(_ context.Context, arcID string) ([]*events.Even
 
 // Cancelled returns the cancel recorded against an arc, or nil where there is
 // none. It scans the log, which is what everything here does.
-func (s *Store) Cancelled(_ context.Context, arcID string) (*events.Event, error) {
+func (s *Store) Cancelled(_ context.Context, ref agent.ArcRef) (*events.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -209,7 +216,7 @@ func (s *Store) Cancelled(_ context.Context, arcID string) (*events.Event, error
 		return nil, err
 	}
 	for i := range all {
-		if all[i].Typ == events.CancelEventType && correlatesTo(&all[i], arcID) {
+		if all[i].Typ == events.CancelEventType && belongsTo(&all[i], ref) {
 			return &all[i], nil
 		}
 	}
@@ -218,6 +225,13 @@ func (s *Store) Cancelled(_ context.Context, arcID string) (*events.Event, error
 
 func correlatesTo(ev *events.Event, arcID string) bool {
 	return ev.CorrelationID != nil && *ev.CorrelationID == arcID
+}
+
+// belongsTo reports whether an event is part of the arc named, in the session
+// named. An arc ID is unique on its own, so the session only catches a ref
+// that was built wrong.
+func belongsTo(ev *events.Event, ref agent.ArcRef) bool {
+	return ev.SessionID == ref.SessionID && correlatesTo(ev, ref.ArcID)
 }
 
 // readFile decodes the whole log. A missing file is an empty log, since a

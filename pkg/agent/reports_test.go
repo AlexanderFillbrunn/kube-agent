@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -42,20 +43,20 @@ func (s *logStore) Persist(_ context.Context, evs ...*events.Event) ([]*events.E
 
 // GetEventsForArc applies the projection's cutoff the way the real store does:
 // everything up to the arc's own opening, plus everything correlated to it.
-func (s *logStore) GetEventsForArc(_ context.Context, arcID string) ([]*events.Event, error) {
+func (s *logStore) GetEventsForArc(_ context.Context, ref ArcRef) ([]*events.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	opening := -1
 	for _, ev := range s.events {
-		if ev.Typ == events.UserMessageEventType && ev.CorrelationID != nil && *ev.CorrelationID == arcID {
+		if ev.Typ == events.UserMessageEventType && ev.CorrelationID != nil && *ev.CorrelationID == ref.ArcID {
 			opening = ev.Seq
 			break
 		}
 	}
 	var selected []*events.Event
 	for _, ev := range s.events {
-		if ev.Seq <= opening || (ev.CorrelationID != nil && *ev.CorrelationID == arcID) {
+		if ev.Seq <= opening || (ev.CorrelationID != nil && *ev.CorrelationID == ref.ArcID) {
 			selected = append(selected, ev)
 		}
 	}
@@ -76,11 +77,11 @@ func runningTaskStore(t *testing.T) *logStore {
 	actor := users.Actor{UserID: "alice", TenantID: "acme"}
 	store := &logStore{}
 	for _, ev := range []*events.Event{
-		{Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
+		{SessionID: testSessionID, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
 			Payload: events.UserMessagePayload{Content: "audit the cluster", Actor: actor}},
-		{ID: "msg-1", Typ: events.AssistantMessageEventType, CorrelationID: &arc,
+		{SessionID: testSessionID, ID: "msg-1", Typ: events.AssistantMessageEventType, CorrelationID: &arc,
 			Payload: events.AssistantMessagePayload{ModelID: "gpt-5", Content: "starting the audit"}},
-		{ID: "task-1", Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc,
+		{SessionID: testSessionID, ID: "task-1", Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc,
 			Payload: events.AsyncTaskInvokePayload{TaskName: "auditor"}},
 	} {
 		if _, err := store.Persist(context.Background(), ev); err != nil {
@@ -99,7 +100,7 @@ func reportsFor(t *testing.T, store *logStore, replies ...*LLMResponse) *TaskRep
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
-	worker, err := NewArcWorker("session", store, store, agent, nil)
+	worker, err := NewArcWorker(store, store, agent, nil)
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
@@ -110,7 +111,7 @@ func reportsFor(t *testing.T, store *logStore, replies ...*LLMResponse) *TaskRep
 	return reports
 }
 
-func taskRef() TaskRef { return TaskRef{ArcID: testArcID, ID: "task-1", Name: "auditor"} }
+func taskRef() TaskRef { return TaskRef{ArcRef: testRef(), ID: "task-1", Name: "auditor"} }
 
 // A completion is recorded and the arc worked, so the model says what came of
 // the work it started.
@@ -178,7 +179,7 @@ func TestAReportNamingTheWrongArcIsRefused(t *testing.T) {
 	store := runningTaskStore(t)
 	reports := reportsFor(t, store)
 
-	_, err := reports.Report(context.Background(), TaskRef{ArcID: testArcID, ID: "not-this-one"}, TaskReport{
+	_, err := reports.Report(context.Background(), TaskRef{ArcRef: testRef(), ID: "not-this-one"}, TaskReport{
 		Kind: TaskReportCompleted, Result: "done", Outcome: events.AsyncTaskOutcomeSuccess})
 	if err == nil {
 		t.Fatal("a report about a task the arc does not hold was accepted")
@@ -208,7 +209,7 @@ func TestAReportOnAHeldArcIsRecordedAndLeft(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
-	worker, err := NewArcWorker("session", store, store, agent, lease)
+	worker, err := NewArcWorker(store, store, agent, lease)
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
@@ -217,9 +218,9 @@ func TestAReportOnAHeldArcIsRecordedAndLeft(t *testing.T) {
 		t.Fatalf("NewTaskReports: %v", err)
 	}
 
-	release, ok := lease.Acquire(testArcID)
-	if !ok {
-		t.Fatal("the arc was already held")
+	release, ok, err := lease.Acquire(context.Background(), testRef())
+	if err != nil || !ok {
+		t.Fatalf("Acquire: held=%v err=%v, want the arc free", !ok, err)
 	}
 	defer release()
 
@@ -241,20 +242,85 @@ func TestAReportOnAHeldArcIsRecordedAndLeft(t *testing.T) {
 }
 
 func TestALeaseIsReleased(t *testing.T) {
+	ctx := context.Background()
 	lease := NewLocalLease()
-	release, ok := lease.Acquire("arc-1")
-	if !ok {
-		t.Fatal("a free arc could not be taken")
+	first := ArcRef{SessionID: testSessionID, ArcID: "arc-1"}
+	second := ArcRef{SessionID: testSessionID, ArcID: "arc-2"}
+
+	release, ok, err := lease.Acquire(ctx, first)
+	if err != nil || !ok {
+		t.Fatalf("a free arc could not be taken: held=%v err=%v", !ok, err)
 	}
-	if _, again := lease.Acquire("arc-1"); again {
+	if _, again, _ := lease.Acquire(ctx, first); again {
 		t.Error("a held arc was taken twice")
 	}
-	if _, other := lease.Acquire("arc-2"); !other {
+	if _, other, _ := lease.Acquire(ctx, second); !other {
 		t.Error("holding one arc blocked another")
 	}
 	release()
-	if _, after := lease.Acquire("arc-1"); !after {
+	if _, after, _ := lease.Acquire(ctx, first); !after {
 		t.Error("a released arc could not be taken again")
+	}
+}
+
+// The same arc ID in two sessions is two arcs. Nothing in this harness
+// produces one, but a lease that keyed on the ID alone would block the second
+// session on the first.
+func TestALeaseKeysOnTheSessionToo(t *testing.T) {
+	ctx := context.Background()
+	lease := NewLocalLease()
+
+	if _, ok, err := lease.Acquire(ctx, ArcRef{SessionID: "one", ArcID: testArcID}); err != nil || !ok {
+		t.Fatalf("a free arc could not be taken: held=%v err=%v", !ok, err)
+	}
+	if _, ok, err := lease.Acquire(ctx, ArcRef{SessionID: "two", ArcID: testArcID}); err != nil || !ok {
+		t.Errorf("the same arc ID in another session was blocked: held=%v err=%v", !ok, err)
+	}
+}
+
+// refusingLease stands in for a lock service that cannot be reached. A caller
+// that read that as "nobody holds it" would run the arc twice.
+type refusingLease struct{ err error }
+
+func (l refusingLease) Acquire(context.Context, ArcRef) (func(), bool, error) {
+	return nil, false, l.err
+}
+
+func TestAWorkerReportsALeaseItCouldNotReach(t *testing.T) {
+	store := runningTaskStore(t)
+	agent, err := NewAgent(nil, nil, &scriptedLLM{})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	worker, err := NewArcWorker(store, store, agent, refusingLease{err: errors.New("no route to the lock service")})
+	if err != nil {
+		t.Fatalf("NewArcWorker: %v", err)
+	}
+
+	worked, err := worker.Work(context.Background(), testRef())
+	if err == nil {
+		t.Fatal("an unreachable lease was reported as an arc somebody else held")
+	}
+	if worked {
+		t.Error("the arc was worked without the lease")
+	}
+}
+
+// A ref naming the wrong session would replay one session's arc under
+// another's name, and everything the run then wrote would be filed there.
+func TestAWorkerRefusesAnArcFromAnotherSession(t *testing.T) {
+	store := runningTaskStore(t)
+	agent, err := NewAgent(nil, nil, &scriptedLLM{})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	worker, err := NewArcWorker(store, store, agent, nil)
+	if err != nil {
+		t.Fatalf("NewArcWorker: %v", err)
+	}
+
+	if _, err := worker.Work(context.Background(), ArcRef{SessionID: "somebody-else", ArcID: testArcID}); err == nil {
+		t.Error("an arc was worked under a session it is not in")
 	}
 }
 

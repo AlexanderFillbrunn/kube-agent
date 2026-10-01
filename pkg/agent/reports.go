@@ -64,7 +64,7 @@ func NewTaskReports(worker *ArcWorker) (*TaskReports, error) {
 // to do is decided by reading the log. A report naming an arc that does not
 // own the task is refused.
 func (r *TaskReports) Report(ctx context.Context, ref TaskRef, report TaskReport) (bool, error) {
-	h, err := r.worker.arcHistory(ctx, ref.ArcID)
+	h, err := r.worker.arcHistory(ctx, ref.ArcRef)
 	if err != nil {
 		return false, err
 	}
@@ -80,7 +80,7 @@ func (r *TaskReports) Report(ctx context.Context, ref TaskRef, report TaskReport
 		return false, err
 	}
 
-	return r.worker.Work(ctx, ref.ArcID)
+	return r.worker.Work(ctx, ref.ArcRef)
 }
 
 // holdsTask reports whether the arc named really owns the task named.
@@ -100,7 +100,7 @@ func holdsTask(h *history.History, ref TaskRef) bool {
 
 // reportEvent turns a report into the record of it.
 func reportEvent(ref TaskRef, report TaskReport) (*events.Event, error) {
-	ev := &events.Event{CorrelationID: &ref.ArcID}
+	ev := &events.Event{SessionID: ref.SessionID, CorrelationID: &ref.ArcID}
 	switch report.Kind {
 	case TaskReportNotification:
 		payload := report.Payload
@@ -143,6 +143,7 @@ func SettleAbandonedTasks(ctx context.Context, persistor EventPersistor, h *hist
 			}
 			arcID := arc.ID
 			_, err := persistor.Persist(ctx, &events.Event{
+				SessionID:     h.SessionID,
 				Typ:           events.AsyncTaskResultEventType,
 				CorrelationID: &arcID,
 				Payload: events.AsyncTaskResultPayload{

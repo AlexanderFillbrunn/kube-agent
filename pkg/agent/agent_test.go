@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,13 +17,17 @@ import (
 )
 
 // fakePersistor stands in for the log. Like a real store it owns the sequence
-// number and leaves an ID or a time the caller already set.
+// number, leaves an ID or a time the caller already set, and is safe to write
+// to from more than one run at once.
 type fakePersistor struct {
+	mu        sync.Mutex
 	next      int
 	persisted []*events.Event
 }
 
 func (p *fakePersistor) Persist(_ context.Context, evs ...*events.Event) ([]*events.Event, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	stored := make([]*events.Event, 0, len(evs))
 	for _, ev := range evs {
 		one := *ev
@@ -38,6 +43,13 @@ func (p *fakePersistor) Persist(_ context.Context, evs ...*events.Event) ([]*eve
 		stored = append(stored, &one)
 	}
 	return stored, nil
+}
+
+// failingPersistor refuses every write.
+type failingPersistor struct{}
+
+func (failingPersistor) Persist(context.Context, ...*events.Event) ([]*events.Event, error) {
+	return nil, errors.New("the log is unreachable")
 }
 
 // A tool call names the message that requested it, and that name is the ID the
@@ -69,7 +81,7 @@ func TestRecordResponseNamesThePersistedMessage(t *testing.T) {
 			Args:     map[string]any{"namespace": "kube-system"},
 		}},
 	}
-	if err := agent.recordResponse(context.Background(), response, state); err != nil {
+	if err := agent.recordResponse(context.Background(), response, "message-1", state); err != nil {
 		t.Fatalf("recordResponse: %v", err)
 	}
 
@@ -163,7 +175,7 @@ func TestRunCallsToolsAndClosesTheArc(t *testing.T) {
 	}
 
 	h := userArcHistory(t)
-	if err := agent.Run(context.Background(), persistor, h, testArcID); err != nil {
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -209,7 +221,7 @@ func TestRunSettlesABrokenToolAsFailed(t *testing.T) {
 	}
 
 	h := userArcHistory(t)
-	if err := agent.Run(context.Background(), persistor, h, testArcID); err != nil {
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -243,7 +255,7 @@ func TestRunRequiresAPersistor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
-	if err := agent.Run(context.Background(), nil, userArcHistory(t), testArcID); err == nil {
+	if err := agent.Run(context.Background(), RunOptions{Persistor: nil, History: userArcHistory(t), ArcID: testArcID}); err == nil {
 		t.Error("a run with no persistor was accepted")
 	}
 	if llm.calls != 0 {
@@ -262,7 +274,7 @@ func runFailing(t *testing.T, failure error) *history.History {
 	}
 
 	h := userArcHistory(t)
-	if err := agent.Run(context.Background(), persistor, h, testArcID); !errors.Is(err, failure) {
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID}); !errors.Is(err, failure) {
 		t.Fatalf("Run returned %v, want the failure it hit", err)
 	}
 	return h
@@ -339,7 +351,7 @@ func TestACancelledRunRecordsNothing(t *testing.T) {
 	}
 
 	h := userArcHistory(t)
-	if err := agent.Run(context.Background(), persistor, h, testArcID); !errors.Is(err, context.Canceled) {
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run returned %v, want an error carrying the cancellation", err)
 	}
 
@@ -372,7 +384,7 @@ func TestAnUnrecordableFailureKeepsItsCause(t *testing.T) {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
-	err = agent.Run(context.Background(), persistor, userArcHistory(t), testArcID)
+	err = agent.Run(context.Background(), RunOptions{Persistor: persistor, History: userArcHistory(t), ArcID: testArcID})
 	if !errors.Is(err, failure) {
 		t.Errorf("Run returned %v, want the cause it started with", err)
 	}
@@ -410,7 +422,7 @@ func TestAHandlerThatReturnsUnderCancellationIsStillRecorded(t *testing.T) {
 	}
 
 	h := userArcHistory(t)
-	if err := agent.Run(ctx, persistor, h, testArcID); !errors.Is(err, context.Canceled) {
+	if err := agent.Run(ctx, RunOptions{Persistor: persistor, History: h, ArcID: testArcID}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run returned %v, want the cancellation", err)
 	}
 
@@ -457,7 +469,7 @@ func TestAToolResultIsWrittenAfterTheContextIsCancelled(t *testing.T) {
 	}
 
 	h := userArcHistory(t)
-	if err := agent.Run(ctx, persistor, h, testArcID); !errors.Is(err, context.Canceled) {
+	if err := agent.Run(ctx, RunOptions{Persistor: persistor, History: h, ArcID: testArcID}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run returned %v, want the cancellation", err)
 	}
 
@@ -499,7 +511,7 @@ func TestAReplyAndItsCallsAreOneWrite(t *testing.T) {
 		{VendorID: "call_a", ToolName: "restart_deployment"},
 		{VendorID: "call_b", ToolName: "list_pods"},
 	}}
-	if err := agent.recordResponse(context.Background(), response, state); err != nil {
+	if err := agent.recordResponse(context.Background(), response, "message-1", state); err != nil {
 		t.Fatalf("recordResponse: %v", err)
 	}
 
@@ -561,7 +573,7 @@ func TestAReplyKeepsItsCallsWhenTheRunIsCancelled(t *testing.T) {
 	}
 
 	h := userArcHistory(t)
-	if err := agent.Run(ctx, persistor, h, testArcID); !errors.Is(err, context.Canceled) {
+	if err := agent.Run(ctx, RunOptions{Persistor: persistor, History: h, ArcID: testArcID}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run returned %v, want the cancellation", err)
 	}
 
@@ -617,7 +629,7 @@ func recoverAbandoned(t *testing.T, annotations *mcp.ToolAnnotations) (*history.
 	}
 
 	h := abandonedArc(t)
-	if err := agent.Run(context.Background(), &fakePersistor{next: 10}, h, testArcID); err != nil {
+	if err := agent.Run(context.Background(), RunOptions{Persistor: &fakePersistor{next: 10}, History: h, ArcID: testArcID}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	return h.Arcs[0].Responses[0].ToolCalls[0], ran
@@ -724,7 +736,7 @@ func TestALateTaskResultGetsTheModelATurn(t *testing.T) {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
-	if err := agent.Run(context.Background(), persistor, h, testArcID); err != nil {
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -751,7 +763,7 @@ func TestATaskResultTheModelHasSeenClosesTheArc(t *testing.T) {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
-	if err := agent.Run(context.Background(), persistor, h, testArcID); err != nil {
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -807,7 +819,7 @@ func TestATaskWaitingOnInputGetsTheModelATurn(t *testing.T) {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
-	if err := agent.Run(context.Background(), persistor, h, testArcID); err != nil {
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -829,7 +841,7 @@ func TestAnAskAlreadyPutToTheUserIsNotRepeated(t *testing.T) {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
-	if err := agent.Run(context.Background(), persistor, h, testArcID); err != nil {
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -848,7 +860,7 @@ func TestAnAnsweredAskGetsNoTurn(t *testing.T) {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
-	if err := agent.Run(context.Background(), persistor, h, testArcID); err != nil {
+	if err := agent.Run(context.Background(), RunOptions{Persistor: persistor, History: h, ArcID: testArcID}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 

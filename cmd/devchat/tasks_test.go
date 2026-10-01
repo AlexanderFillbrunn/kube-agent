@@ -69,8 +69,8 @@ func newHarness(t *testing.T, replies ...*agent.LLMResponse) *harness {
 		t.Fatalf("NewAgent: %v", err)
 	}
 
-	persistor := agent.StampIdentity(agent.GuardCancellation(store, store), path)
-	worker, err := agent.NewArcWorker(path, persistor, store, chat, agent.NewLocalLease())
+	persistor := agent.MintIdentity(agent.GuardCancellation(store, store))
+	worker, err := agent.NewArcWorker(persistor, store, chat, agent.NewLocalLease())
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
@@ -276,11 +276,11 @@ func TestReopeningALogSettlesAbandonedTasks(t *testing.T) {
 	ctx := context.Background()
 	arc := "arc-1"
 	for _, ev := range []*events.Event{
-		{Typ: events.UserMessageEventType, ID: arc, CorrelationID: &arc, Actor: h.session.actor,
+		{SessionID: h.session.id, Typ: events.UserMessageEventType, ID: arc, CorrelationID: &arc, Actor: h.session.actor,
 			Payload: events.UserMessagePayload{Content: "audit the cluster", Actor: h.session.actor}},
-		{Typ: events.AssistantMessageEventType, ID: "msg-1", CorrelationID: &arc,
+		{SessionID: h.session.id, Typ: events.AssistantMessageEventType, ID: "msg-1", CorrelationID: &arc,
 			Payload: events.AssistantMessagePayload{ModelID: "test", Content: "running"}},
-		{Typ: events.AsyncTaskInvokeEventType, ID: "task-1", CorrelationID: &arc,
+		{SessionID: h.session.id, Typ: events.AsyncTaskInvokeEventType, ID: "task-1", CorrelationID: &arc,
 			Payload: events.AsyncTaskInvokePayload{TaskName: "audit_namespaces"}},
 	} {
 		if _, err := h.session.persistor.Persist(ctx, ev); err != nil {

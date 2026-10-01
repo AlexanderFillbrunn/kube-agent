@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"fillbrunn.ai/kube-agent/pkg/agent"
 	"fillbrunn.ai/kube-agent/pkg/events"
 	"fillbrunn.ai/kube-agent/pkg/users"
 )
@@ -111,6 +112,11 @@ func TestOpenResumesTheSequence(t *testing.T) {
 	}
 }
 
+// ref addresses an arc of the session the fixtures write under.
+func ref(arcID string) agent.ArcRef {
+	return agent.ArcRef{SessionID: "session", ArcID: arcID}
+}
+
 // The cutoff is the contract the projection rests on: everything up to the
 // arc's own user message, plus everything correlated to it afterwards, and
 // nothing else.
@@ -134,7 +140,7 @@ func TestGetEventsForArcAppliesTheCutoff(t *testing.T) {
 		t.Fatalf("Persist: %v", err)
 	}
 
-	selected, err := store.GetEventsForArc(ctx, "arc-1")
+	selected, err := store.GetEventsForArc(ctx, ref("arc-1"))
 	if err != nil {
 		t.Fatalf("GetEventsForArc: %v", err)
 	}
@@ -157,7 +163,7 @@ func TestGetEventsForArcAppliesTheCutoff(t *testing.T) {
 
 	// A later arc sees the earlier one whole, because it is conversation
 	// history by then.
-	selected, err = store.GetEventsForArc(ctx, "arc-2")
+	selected, err = store.GetEventsForArc(ctx, ref("arc-2"))
 	if err != nil {
 		t.Fatalf("GetEventsForArc: %v", err)
 	}
@@ -168,8 +174,23 @@ func TestGetEventsForArcAppliesTheCutoff(t *testing.T) {
 
 func TestGetEventsForArcRejectsAnUnknownArc(t *testing.T) {
 	store := openTemp(t)
-	if _, err := store.GetEventsForArc(context.Background(), "absent"); err == nil {
+	if _, err := store.GetEventsForArc(context.Background(), ref("absent")); err == nil {
 		t.Error("an unknown arc was accepted")
+	}
+}
+
+// An arc is addressed by session as well as by ID, so a ref naming another
+// session finds nothing even when the arc ID is one the log holds.
+func TestGetEventsForArcIsScopedToItsSession(t *testing.T) {
+	store := openTemp(t)
+	ctx := context.Background()
+	if _, err := store.Persist(ctx, userMessage("arc-1", "first question")); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+
+	elsewhere := agent.ArcRef{SessionID: "another-session", ArcID: "arc-1"}
+	if _, err := store.GetEventsForArc(ctx, elsewhere); err == nil {
+		t.Error("an arc was served to a ref naming a different session")
 	}
 }
 

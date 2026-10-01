@@ -22,6 +22,7 @@ The rest are proposals rather than specifications:
     docs/INTERRUPTS.md   how a tool call is put to a human
     docs/RE-ENTRY.md     how an arc that already exists is worked again
     docs/CANCELLATION.md what stopping an arc reaches, and what it does not
+    docs/EVENT-SINK.md   how a run is followed from outside the process running it
 
 The code follows none of them in full, and several are partly built: the log
 and the projection carry interrupts already but nothing raises one, an arc is
@@ -56,8 +57,9 @@ model is in use. Nothing validates the name: whether an endpoint serves it is
 only answered by asking, so a wrong one shows up as a failed turn.
 
 The interface never reads the agent's state. It follows a run through two
-sinks the agent is built with — `Tokens` for streamed text and `Observer` for
-events as they are folded — so what it shows is what was recorded.
+sinks, neither of which the agent knows about: events are published by the
+persistor that wrote them, whoever wrote them, and streamed text is published
+by the worker. So what it shows is what was recorded.
 
 The tools it offers answer from canned data and touch no cluster. Sessions are
 kept under `.devchat/`, one JSON event per line, which makes a session

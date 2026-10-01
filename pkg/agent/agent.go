@@ -25,17 +25,12 @@ const (
 	ArcStateClose	  arcState = iota
 )
 
+// AgentConfig is what an agent is built with, and holds nothing that differs
+// from one run to the next. Following a run is not here: notification hangs
+// off the persistor, so an agent has no idea whether anybody is watching. See
+// EventSink and docs/EVENT-SINK.md.
 type AgentConfig struct {
 	SystemPrompt string
-
-	// Tokens receives the model's text as it streams. A nil sink discards it,
-	// and the reply is recorded whole either way.
-	Tokens Sink[string]
-
-	// Observer is handed every event once it has been folded, so a caller can
-	// follow a run as it happens. It only watches, and an observer that
-	// returns an error stops the run.
-	Observer Sink[*events.Event]
 }
 
 type Agent struct {
@@ -102,39 +97,71 @@ func NewAgent(config *AgentConfig, tools *ToolRegistry, llm LLM, options ...Agen
 	return agent, nil
 }
 
+// RunOptions are the parts of a run that differ from one run to the next. The
+// agent is built once and holds none of them, so one agent serves as many
+// sessions as it is handed.
+type RunOptions struct {
+	// Persistor is where the run writes.
+	Persistor EventPersistor
+
+	// History is the arc's log, already folded. The session it names is what
+	// the run's own events are filed under.
+	History *history.History
+
+	// ArcID names the arc in that history the run is to work.
+	ArcID string
+
+	// Tokens follows the model's text as it streams, labelled with the message
+	// that will record it. It is nil for a run nobody is watching, which is
+	// every run of a worker with no interface attached, and a watcher's error
+	// is dropped either way.
+	Tokens Sink[Token]
+}
+
 type agentState struct {
-	history *history.History
-	arc *history.Arc
+	history   *history.History
+	arc       *history.Arc
 	foldState *history.FoldState
 	persistor EventPersistor
+	tokens    Sink[Token]
+}
+
+// ref names the arc the run is working, for anything that has to address it
+// from outside this process.
+func (s *agentState) ref() ArcRef {
+	return ArcRef{SessionID: s.history.SessionID, ArcID: s.arc.ID}
 }
 
 // Run invokes the agent to complete an arc, i.e. a user message triggering the
-// agent. The persistor is passed per run, so one agent serves as many sessions
-// as it is handed.
-func (a Agent) Run(ctx context.Context, persistor EventPersistor, h *history.History, arcID string) error {
-	if persistor == nil {
+// agent.
+func (a Agent) Run(ctx context.Context, run RunOptions) error {
+	if run.Persistor == nil {
 		return errors.New("a run needs an event persistor")
+	}
+	if run.History == nil {
+		return errors.New("a run needs a history")
+	}
+	if run.History.SessionID == "" {
+		return errors.New("a run needs a history that names its session")
 	}
 
 	var arc *history.Arc
-	for _, a := range slices.Backward(h.Arcs) {
-		if a.ID == arcID {
-			arc = a
+	for _, candidate := range slices.Backward(run.History.Arcs) {
+		if candidate.ID == run.ArcID {
+			arc = candidate
 			break
 		}
 	}
 	if arc == nil {
-		return fmt.Errorf("arc not found in history: %s", arcID)
+		return fmt.Errorf("arc not found in history: %s", run.ArcID)
 	}
 
-	foldState := history.FoldStateFromHistory(h)
-
 	state := &agentState{
-		history: h,
-		arc: arc,
-		foldState: foldState,
-		persistor: persistor,
+		history:   run.History,
+		arc:       arc,
+		foldState: history.FoldStateFromHistory(run.History),
+		persistor: run.Persistor,
+		tokens:    run.Tokens,
 	}
 
 	if err := a.steps(ctx, state); err != nil {
@@ -233,6 +260,13 @@ func (a Agent) persistAndFold(ctx context.Context, state *agentState, evs ...*ev
 	if _, starts := guardedArc(evs); !starts {
 		ctx = context.WithoutCancel(ctx)
 	}
+
+	// Every writer names the session it writes for, and the agent's is the
+	// history it was given. Nothing further down the chain invents one.
+	for _, ev := range evs {
+		ev.SessionID = state.history.SessionID
+	}
+
 	stored, err := state.persistor.Persist(ctx, evs...)
 	if err != nil {
 		return nil, fmt.Errorf("error persisting %s: %w", eventTypes(evs), err)
@@ -240,13 +274,6 @@ func (a Agent) persistAndFold(ctx context.Context, state *agentState, evs ...*ev
 	for _, ev := range stored {
 		if err := state.history.Update(ev, state.foldState); err != nil {
 			return nil, fmt.Errorf("error folding %s event: %w", ev.Typ, err)
-		}
-		// The observer is told after the fold, so it sees the history the next
-		// step reads.
-		if a.config.Observer != nil {
-			if err := a.config.Observer.Consume(ev); err != nil {
-				return nil, fmt.Errorf("error observing %s event: %w", ev.Typ, err)
-			}
 		}
 	}
 	return stored, nil
@@ -263,19 +290,34 @@ func eventTypes(evs []*events.Event) string {
 
 // llmStep calls the LLM with the history so far and records what it replied.
 func (a Agent) llmStep(ctx context.Context, state *agentState) error {
-	tokSink := a.config.Tokens
-	if tokSink == nil {
-		tokSink = SinkFromFunc(func(string) error { return nil })
-	}
+	// The message is named before the model is called rather than when the
+	// reply is written, because the text being streamed has to say which
+	// message will record it.
+	messageID := NewEventID()
 
 	response, err := a.llm.StreamResponse(ctx, state.history, &LLMOptions{
 		SystemPrompt: a.config.SystemPrompt,
 		Tools:        CombineTools(a.tools, a.tasks),
-	}, tokSink)
+	}, state.tokenSink(messageID))
 	if err != nil {
 		return fmt.Errorf("error calling LLM: %w", err)
 	}
-	return a.recordResponse(ctx, response, state)
+	return a.recordResponse(ctx, response, messageID, state)
+}
+
+// tokenSink labels the model's text with the message that will record it. A
+// run nobody is watching discards it, and the watcher's error is dropped
+// rather than returned: a screen cannot fail a run.
+//
+// The provider is handed a plain Sink[string], so no LLM implementation learns
+// what an arc or a message is.
+func (s *agentState) tokenSink(messageID string) Sink[string] {
+	return SinkFromFunc(func(text string) error {
+		if s.tokens != nil {
+			_ = s.tokens.Consume(Token{MessageID: messageID, Content: text})
+		}
+		return nil
+	})
 }
 
 // recordResponse writes a reply to the log: the message and one event per call
@@ -283,11 +325,10 @@ func (a Agent) llmStep(ctx context.Context, state *agentState) error {
 //
 // They go together because a log holding the message alone reads as an answer
 // the model never gave, and the next run closes the arc on it. The message ID
-// is minted here rather than read back, since the calls have to name it before
-// any of them is written.
-func (a Agent) recordResponse(ctx context.Context, response *LLMResponse, state *agentState) error {
-	messageID := NewEventID()
-
+// is the one llmStep minted before the call rather than one read back, since
+// the calls have to name it before any of them is written and the tokens had
+// to name it before that.
+func (a Agent) recordResponse(ctx context.Context, response *LLMResponse, messageID string, state *agentState) error {
 	batch := make([]*events.Event, 0, len(response.ToolCalls)+1)
 	batch = append(batch, &events.Event{
 		ID:            messageID,
@@ -533,7 +574,7 @@ func (a Agent) startTask(ctx context.Context, call *history.ToolCall, state *age
 		return err
 	}
 
-	ref := TaskRef{ArcID: state.arc.ID, ID: invocationID, Name: call.ToolName}
+	ref := TaskRef{ArcRef: state.ref(), ID: invocationID, Name: call.ToolName}
 	if err := definition.Start(ctx, ref, call.Args); err != nil {
 		return a.settleUnstartedTask(ctx, call, ref, err, state)
 	}
@@ -584,7 +625,11 @@ func (a Agent) cancelTask(ctx context.Context, call *history.ToolCall, state *ag
 	}
 
 	reason, _ := stringArg(call.Args, "reason")
-	ref := TaskRef{ArcID: task.CorrelationID, ID: task.ID, Name: task.TaskName}
+	ref := TaskRef{
+		ArcRef: ArcRef{SessionID: state.history.SessionID, ArcID: task.CorrelationID},
+		ID:     task.ID,
+		Name:   task.TaskName,
+	}
 	if err := a.controller.Cancel(ctx, ref, reason); err != nil {
 		return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
 			"task %s could not be reached to stop it: %s", task.TaskName, err), IsError: true}, state)
@@ -617,7 +662,11 @@ func (a Agent) provideTaskInput(ctx context.Context, call *history.ToolCall, sta
 			"task %s is %s and is not waiting for input.", task.TaskName, task.Status), IsError: true}, state)
 	}
 
-	ref := TaskRef{ArcID: task.CorrelationID, ID: task.ID, Name: task.TaskName}
+	ref := TaskRef{
+		ArcRef: ArcRef{SessionID: state.history.SessionID, ArcID: task.CorrelationID},
+		ID:     task.ID,
+		Name:   task.TaskName,
+	}
 	if err := a.controller.ProvideInput(ctx, ref, input); err != nil {
 		return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
 			"task %s could not be reached: %s", task.TaskName, err), IsError: true}, state)

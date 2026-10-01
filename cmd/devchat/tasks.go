@@ -34,9 +34,10 @@ type localTasks struct {
 	// is built from the registry these tasks are registered in.
 	reports *agent.TaskReports
 
-	// watcher is told what a task reported, so the interface can show it. The
-	// log is the record; this is only the screen.
-	watcher func(ref agent.TaskRef, text string, state toolState)
+	// unfiled is told about a report that could not be written. Everything a
+	// task says that does reach the log reaches the screen through the event
+	// sink; this is the one case there is nothing in the log to publish.
+	unfiled func(ref agent.TaskRef, err error)
 
 	// deferred is told when a report did not get its arc a turn because
 	// something else was working it. The report is filed either way; what is
@@ -55,10 +56,10 @@ func newLocalTasks() *localTasks {
 }
 
 // attach gives the tasks somewhere to report to, once there is one.
-func (l *localTasks) attach(reports *agent.TaskReports, watcher func(agent.TaskRef, string, toolState), deferred func(string)) {
+func (l *localTasks) attach(reports *agent.TaskReports, unfiled func(agent.TaskRef, error), deferred func(string)) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.reports, l.watcher, l.deferred = reports, watcher, deferred
+	l.reports, l.unfiled, l.deferred = reports, unfiled, deferred
 }
 
 // register adds the canned tasks to a registry.
@@ -185,55 +186,29 @@ func (l *localTasks) stopped(ref agent.TaskRef) {
 	})
 }
 
-// report calls the ingress and tells the screen what was said. A report that
-// cannot be filed is shown and dropped, since there is nobody above a task to
-// hand the failure to.
+// report calls the ingress, which writes the report and gives the arc a turn.
+// Nothing here tells the screen what was said: the report is published from
+// the persistor that wrote it, like everything else in the log.
+//
+// A report that cannot be filed is the exception, since there is nothing to
+// publish and nobody above a task to hand the failure to.
 func (l *localTasks) report(ref agent.TaskRef, report agent.TaskReport) {
 	l.mu.Lock()
-	reports, watcher, deferred := l.reports, l.watcher, l.deferred
+	reports, unfiled, deferred := l.reports, l.unfiled, l.deferred
 	l.mu.Unlock()
 
-	if watcher != nil {
-		watcher(ref, reportText(report), reportState(report))
-	}
 	if reports == nil {
 		return
 	}
 
 	worked, err := reports.Report(context.Background(), ref, report)
 	if err != nil {
-		if watcher != nil {
-			watcher(ref, fmt.Sprintf("could not be filed: %v", err), toolFailed)
+		if unfiled != nil {
+			unfiled(ref, err)
 		}
 		return
 	}
 	if !worked && deferred != nil {
 		deferred(ref.ArcID)
-	}
-}
-
-func reportText(report agent.TaskReport) string {
-	switch report.Kind {
-	case agent.TaskReportInputRequested:
-		return "asks: " + report.Message
-	case agent.TaskReportCompleted:
-		return fmt.Sprintf("%v", report.Result)
-	default:
-		return report.Message
-	}
-}
-
-func reportState(report agent.TaskReport) toolState {
-	switch {
-	case report.Kind == agent.TaskReportInputRequested:
-		return toolWaiting
-	case report.Kind != agent.TaskReportCompleted:
-		return toolRunning
-	case report.Outcome == events.AsyncTaskOutcomeCancelled:
-		return toolStopped
-	case report.Outcome == events.AsyncTaskOutcomeFailed:
-		return toolFailed
-	default:
-		return toolDone
 	}
 }

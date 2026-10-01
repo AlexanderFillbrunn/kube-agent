@@ -16,7 +16,14 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const testArcID = "arc-1"
+const (
+	testArcID     = "arc-1"
+	testSessionID = "session"
+)
+
+// testRef addresses the arc the fixtures build, the way everything that
+// stores, locks or routes by arc is addressed.
+func testRef() ArcRef { return ArcRef{SessionID: testSessionID, ArcID: testArcID} }
 
 // newTestServer serves one canned response and captures the request that asked
 // for it.
@@ -49,8 +56,8 @@ func userArcHistory(t *testing.T) *history.History {
 	t.Helper()
 	arc := testArcID
 	actor := users.Actor{UserID: "alice", TenantID: "acme"}
-	h, err := history.Replay("session", []events.Event{{
-		SessionID: "session", ID: arc, Seq: 0, Timestamp: time.Unix(0, 0),
+	h, err := history.Replay(testSessionID, []events.Event{{
+		SessionID: testSessionID, ID: arc, Seq: 0, Timestamp: time.Unix(0, 0),
 		Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
 		Payload: events.UserMessagePayload{Content: "how many pods are pending?", Actor: actor},
 	}})
