@@ -171,7 +171,9 @@ func cancelTaskTool() *mcp.Tool {
 func provideTaskInputTool() *mcp.Tool {
 	return &mcp.Tool{
 		Name:        ProvideTaskInputTool,
-		Description: "Give a task that is waiting for input the answer it asked for.",
+		Description: "Answer a question a running task has asked. Only for a question you have " +
+			"been given: a task you expect to ask something has not asked it yet, and a guess " +
+			"made ahead of the question is not an answer to it.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

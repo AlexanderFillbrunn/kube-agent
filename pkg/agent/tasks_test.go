@@ -421,7 +421,8 @@ func TestAnsweringAnUnknownTaskIsAnErrorTheModelCanRead(t *testing.T) {
 	}
 }
 
-// A task that is not waiting has nothing to be told.
+// A question the run has not been given is one it cannot answer, whether the
+// task has yet to ask it or asked it after this run read the log.
 func TestAnsweringATaskThatIsNotWaitingIsRefused(t *testing.T) {
 	tasks := taskRegistryWith(t, "auditor", func(context.Context, TaskRef, any) error { return nil })
 	controller := &fakeController{}
@@ -431,8 +432,8 @@ func TestAnsweringATaskThatIsNotWaitingIsRefused(t *testing.T) {
 		VendorID: "call_2", ToolName: ProvideTaskInputTool,
 		Args: map[string]any{"task_id": "task-1", "input": "kube-system"}})
 
-	if text := resultText(t, lastCallIn(t, h, "arc-2")); !strings.Contains(text, "not waiting for input") {
-		t.Errorf("result = %q, want it to say the task was not asking", text)
+	if text := resultText(t, lastCallIn(t, h, "arc-2")); !strings.Contains(text, "asked nothing you have been given") {
+		t.Errorf("result = %q, want it to say there was no question to answer", text)
 	}
 	if len(controller.inputs) != 0 {
 		t.Errorf("inputs = %#v, want the controller left alone", controller.inputs)

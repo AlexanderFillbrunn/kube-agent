@@ -622,8 +622,10 @@ func (a Agent) startTask(ctx context.Context, call *history.ToolCall, state *age
 	}
 
 	return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
-		"task %s started, id %s. It runs on its own and reports back; you will be told what it "+
-			"says. Answer it with %s and stop it with %s, both of which take that id.",
+		"task %s started, id %s. It runs on its own, so say what you have and end your turn. "+
+			"Anything it says reaches you as a turn of its own, a question included, so there is "+
+			"nothing here to wait for and nothing to poll. Answer a question of its with %s once "+
+			"you have been given one, and stop it with %s. Both take that id.",
 		ref.Name, ref.ID, ProvideTaskInputTool, CancelTaskTool)}, state)
 }
 
@@ -699,10 +701,14 @@ func (a Agent) provideTaskInput(ctx context.Context, call *history.ToolCall, sta
 		return a.settleCall(ctx, call, ToolOutcome{
 			Result: "no input was given to hand to the task", IsError: true}, state)
 	}
-	// Not a concurrency guard, just another check with concrete error
+	// A run reads the log as it stood when the run began, so a question asked
+	// since is not here yet and this says so rather than claiming the task is
+	// not asking. Answering ahead of the question is the other way in.
 	if task.Status != history.AsyncTaskWaiting {
 		return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
-			"task %s is %s and is not waiting for input.", task.TaskName, task.Status), IsError: true}, state)
+			"task %s has asked nothing you have been given to answer, and reads as %s here. Wait "+
+				"to be handed its question rather than answering one you expect it to ask.",
+			task.TaskName, task.Status), IsError: true}, state)
 	}
 
 	// The answer names the question it answers, so a task that has moved on
