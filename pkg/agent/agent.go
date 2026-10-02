@@ -164,10 +164,48 @@ func (a Agent) Run(ctx context.Context, run RunOptions) error {
 		tokens:    run.Tokens,
 	}
 
+	// A cancelled arc has no agent work left, but the tasks it started might
+	// still be running, so closing here.
+	if state.arc.Cancel != nil {
+		return a.stopArcTasks(ctx, state)
+	}
+
 	if err := a.steps(ctx, state); err != nil {
 		return a.recordFailure(ctx, err, state)
 	}
 	return nil
+}
+
+// stopArcTasks asks the tasks a cancelled arc started to stop.
+//
+// It writes nothing. The cancel ends the waiting, and what became of work
+// already under way is the runner's to report, so the log learns the outcome
+// when the task says what it was.
+//
+// A task that could not be reached fails the run, so whoever handed the arc
+// over comes back with it. Asking a task to stop twice is harmless, which is
+// what makes coming back safe.
+func (a Agent) stopArcTasks(ctx context.Context, state *agentState) error {
+	if a.controller == nil {
+		return nil
+	}
+
+	reason := ""
+	if state.arc.Cancel != nil && state.arc.Cancel.Reason != nil {
+		reason = *state.arc.Cancel.Reason
+	}
+
+	var unreached []error
+	for _, task := range state.arc.AsyncTasks {
+		if task.FinishedSeq != nil {
+			continue
+		}
+		ref := TaskRef{ArcRef: state.ref(), ID: task.ID, Name: task.TaskName}
+		if err := a.controller.Cancel(ctx, ref, reason); err != nil {
+			unreached = append(unreached, fmt.Errorf("stop task %s: %w", task.TaskName, err))
+		}
+	}
+	return errors.Join(unreached...)
 }
 
 // recordFailure closes an arc the agent could not finish, and returns the
@@ -389,12 +427,6 @@ func (a Agent) toolStep(ctx context.Context, state *agentState) error {
 	}
 
 	for _, call := range pending {
-		// Re-read before each call, because a cancel recorded elsewhere
-		// reaches this run through the fold.
-		if state.arc.Status() != history.ArcStatusPending {
-			return nil
-		}
-
 		// A call another run already dispatched may have taken effect. Only a
 		// tool declared safe to repeat gets a second attempt.
 		if call.Phase() == history.ToolCallPhaseDispatched && !a.tools.SafeToRepeat(call.ToolName) {
@@ -527,13 +559,23 @@ func unreportedTaskNews(task *history.AsyncTask, respondedSeq int) bool {
 // lastInputRequestSeq is where the task last stopped to ask, or -1 for a task
 // that never has.
 func lastInputRequestSeq(task *history.AsyncTask) int {
-	seq := -1
-	for _, event := range task.Events {
-		if event.Type == history.AsyncTaskEventInputRequested {
-			seq = event.Seq
+	if request := lastInputRequest(task); request != nil {
+		return request.Seq
+	}
+	return -1
+}
+
+// lastInputRequest is the question the task last stopped at, or nil for a task
+// that never has. A waiting task always has one, since asking is what put it
+// in that state.
+func lastInputRequest(task *history.AsyncTask) *history.AsyncTaskEvent {
+	var last *history.AsyncTaskEvent
+	for i := range task.Events {
+		if task.Events[i].Type == history.AsyncTaskEventInputRequested {
+			last = &task.Events[i]
 		}
 	}
-	return seq
+	return last
 }
 
 // knows reports whether a call by this name has somewhere to go: a registered
@@ -657,34 +699,54 @@ func (a Agent) provideTaskInput(ctx context.Context, call *history.ToolCall, sta
 		return a.settleCall(ctx, call, ToolOutcome{
 			Result: "no input was given to hand to the task", IsError: true}, state)
 	}
+	// Not a concurrency guard, just another check with concrete error
 	if task.Status != history.AsyncTaskWaiting {
 		return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
 			"task %s is %s and is not waiting for input.", task.TaskName, task.Status), IsError: true}, state)
 	}
 
-	ref := TaskRef{
-		ArcRef: ArcRef{SessionID: state.history.SessionID, ArcID: task.CorrelationID},
-		ID:     task.ID,
-		Name:   task.TaskName,
-	}
-	if err := a.controller.ProvideInput(ctx, ref, input); err != nil {
+	// The answer names the question it answers, so a task that has moved on
+	// refuses it rather than taking it for whatever it is waiting on now.
+	request := lastInputRequest(task)
+	if request == nil {
 		return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
-			"task %s could not be reached: %s", task.TaskName, err), IsError: true}, state)
+			"task %s is waiting, but the log holds no question of its to answer.",
+			task.TaskName), IsError: true}, state)
 	}
 
-	// The record belongs to the arc that owns the task, so the arc waiting on
-	// this answer is the one that reads it. It is the only event the agent
-	// writes outside the arc it is working on.
-	if _, err := a.persistAndFold(ctx, state, &events.Event{
-		Typ:           events.AsyncTaskInputProvidedEventType,
-		CorrelationID: &task.CorrelationID,
-		Payload:       events.AsyncTaskInputProvidedPayload{CausationID: task.ID, Message: input},
-	}); err != nil {
-		return err
+	ref := TaskRef{
+		SessionID: state.history.SessionID,
+		ArcID:     task.CorrelationID,
+		ID:        task.ID,
+		Name:      task.TaskName,
+	}
+	// A task somebody else answered first refuses this answer, and a task that
+	// cannot be reached at all fails the same way. Nothing here tells the two
+	// apart, so the text covers both.
+	if err := a.controller.ProvideInput(ctx, ref, request.ID, input); err != nil {
+		return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
+			"task %s did not take the input: %s. It may have been answered already, or have "+
+				"finished, so read what it says next before answering again.",
+			task.TaskName, err), IsError: true}, state)
 	}
 
-	return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
-		"task %s was given the input and is running again.", task.TaskName)}, state)
+	// Both events say the same already-settled thing, that the input reached
+	// the task, so neither may survive without the other.
+	//
+	// The record of the input belongs to the arc that owns the task, so the
+	// arc waiting on this answer is the one that reads it. It is the only
+	// event the agent writes outside the arc it is working on, and so the
+	// only write that needs the persistor to be atomic across two arcs.
+	_, err := a.persistAndFold(ctx, state,
+		&events.Event{
+			Typ:           events.AsyncTaskInputProvidedEventType,
+			CorrelationID: &task.CorrelationID,
+			Payload:       events.AsyncTaskInputProvidedPayload{CausationID: task.ID, Message: input},
+		},
+		callResult(call, ToolOutcome{Result: fmt.Sprintf(
+			"task %s was given the input and is running again.", task.TaskName)}, state),
+	)
+	return err
 }
 
 // addressedTask finds the task a call names, or says why it could not. The
@@ -718,7 +780,14 @@ func (a Agent) recordDispatch(ctx context.Context, call *history.ToolCall, state
 
 // settleCall answers one call with what came of it.
 func (a Agent) settleCall(ctx context.Context, call *history.ToolCall, outcome ToolOutcome, state *agentState) error {
-	_, err := a.persistAndFold(ctx, state, &events.Event{
+	_, err := a.persistAndFold(ctx, state, callResult(call, outcome, state))
+	return err
+}
+
+// callResult is the record of a call having been answered, for a caller that
+// writes it alongside something else.
+func callResult(call *history.ToolCall, outcome ToolOutcome, state *agentState) *events.Event {
+	return &events.Event{
 		Typ:           events.ToolResultEventType,
 		CorrelationID: &state.arc.ID,
 		Payload: events.ToolResultPayload{
@@ -726,8 +795,7 @@ func (a Agent) settleCall(ctx context.Context, call *history.ToolCall, outcome T
 			Result:      outcome.Result,
 			IsError:     outcome.IsError,
 		},
-	})
-	return err
+	}
 }
 
 // stringArg reads one string argument out of a call's arguments, which the log

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"fillbrunn.ai/kube-agent/pkg/events"
 	"fillbrunn.ai/kube-agent/pkg/history"
@@ -200,4 +201,254 @@ func TestTheGuardServesConcurrentRuns(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// recordingController is a TaskController that remembers what it was asked to
+// stop, and can refuse.
+type recordingController struct {
+	mu      sync.Mutex
+	stopped []TaskRef
+	reasons []string
+	err     error
+}
+
+func (c *recordingController) Cancel(_ context.Context, ref TaskRef, reason string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err != nil {
+		return c.err
+	}
+	c.stopped = append(c.stopped, ref)
+	c.reasons = append(c.reasons, reason)
+	return nil
+}
+
+func (c *recordingController) ProvideInput(context.Context, TaskRef, string, string) error {
+	return nil
+}
+
+// cancelledTaskArc is an arc with a task still running and a cancel recorded
+// against it: what the log holds when somebody withdrew an arc whose task is
+// off doing something.
+func cancelledTaskArc(t *testing.T, reason string) *logStore {
+	t.Helper()
+	store := runningTaskStore(t)
+	arc := testArcID
+	if _, err := store.Persist(context.Background(), &events.Event{
+		SessionID: testSessionID, Typ: events.CancelEventType, CorrelationID: &arc,
+		Payload: events.CancelPayload{Reason: &reason},
+	}); err != nil {
+		t.Fatalf("persist the cancel: %v", err)
+	}
+	return store
+}
+
+// workerOver builds a worker whose agent can start and reach tasks.
+func workerOver(t *testing.T, store *logStore, controller TaskController, options ...ArcWorkerOption) *ArcWorker {
+	t.Helper()
+	tasks := NewTaskRegistry()
+	if err := tasks.RegisterTask(&mcp.Tool{Name: "auditor"}, func(context.Context, TaskRef, any) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("RegisterTask: %v", err)
+	}
+	agent, err := NewAgent(nil, nil, &scriptedLLM{}, WithTasks(tasks, controller))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	worker, err := NewArcWorker(store, store, agent, nil, options...)
+	if err != nil {
+		t.Fatalf("NewArcWorker: %v", err)
+	}
+	return worker
+}
+
+// Nobody who cancels can reach work running somewhere else, and an arc whose
+// only unfinished work is a task has no run on it to notice. So the reach
+// happens when a worker is next given the arc.
+func TestWorkingACancelledArcStopsItsTasks(t *testing.T) {
+	store := cancelledTaskArc(t, "changed my mind")
+	controller := &recordingController{}
+
+	worked, err := workerOver(t, store, controller).Work(context.Background(), testRef())
+	if err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if !worked {
+		t.Fatal("the arc was not worked")
+	}
+
+	if len(controller.stopped) != 1 {
+		t.Fatalf("stopped %d tasks, want the one that was running", len(controller.stopped))
+	}
+	if got := controller.stopped[0]; got.ID != "task-1" || got.ArcRef != testRef() {
+		t.Errorf("stopped %+v, want task-1 under %s", got, testRef())
+	}
+	// The reason the human gave travels to the runner, which is the only place
+	// it can say why the work was called off.
+	if got := controller.reasons[0]; got != "changed my mind" {
+		t.Errorf("stopped with reason %q, want the one the cancel carried", got)
+	}
+
+	// Nothing is written. The cancel ends the waiting, and what became of work
+	// already under way is the runner's to report.
+	want := "USER_MESSAGE, ASSISTANT_MESSAGE, ASYNC_TASK_INVOKE, CANCEL"
+	if got := store.types(); got != want {
+		t.Errorf("log = %s, want %s", got, want)
+	}
+}
+
+// A task that could not be reached fails the run, so whoever handed the arc
+// over comes back with it. It is not recorded as a failure: the arc is already
+// closed by the cancel, and a controller nobody could reach is not a second
+// thing to put in the log.
+func TestATaskThatCannotBeStoppedFailsTheRunWithoutRecordingIt(t *testing.T) {
+	store := cancelledTaskArc(t, "changed my mind")
+	controller := &recordingController{err: errors.New("the runner is unreachable")}
+
+	_, err := workerOver(t, store, controller).Work(context.Background(), testRef())
+	if err == nil {
+		t.Fatal("Work reported success although the task was never told")
+	}
+
+	want := "USER_MESSAGE, ASSISTANT_MESSAGE, ASYNC_TASK_INVOKE, CANCEL"
+	if got := store.types(); got != want {
+		t.Errorf("log = %s, want %s", got, want)
+	}
+}
+
+// An arc cancelled with nothing running is the cheap no-op the queue deals in.
+func TestWorkingACancelledArcWithNoTasksDoesNothing(t *testing.T) {
+	store := cancelledTaskArc(t, "")
+	// Settle the task, so the arc is cancelled with nothing left to reach.
+	if _, err := store.Persist(context.Background(), &events.Event{
+		SessionID: testSessionID, Typ: events.AsyncTaskResultEventType, CorrelationID: ptr(testArcID),
+		Payload: events.AsyncTaskResultPayload{
+			CausationID: "task-1", Result: "done", Outcome: events.AsyncTaskOutcomeSuccess},
+	}); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	controller := &recordingController{}
+
+	if _, err := workerOver(t, store, controller).Work(context.Background(), testRef()); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+	if len(controller.stopped) != 0 {
+		t.Errorf("stopped %+v, want nothing", controller.stopped)
+	}
+}
+
+// openArcStore is an arc with nothing but the user's message in it.
+func openArcStore(t *testing.T) *logStore {
+	t.Helper()
+	store := &logStore{}
+	if _, err := store.Persist(context.Background(), &events.Event{
+		SessionID: testSessionID, Typ: events.UserMessageEventType, CorrelationID: ptr(testArcID),
+		Payload: events.UserMessagePayload{Content: "wait for the rollout"},
+	}); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	store.events[0].ID = testArcID
+	return store
+}
+
+// The guard cannot stop a tool that is already running: it refuses the next
+// dispatch, which is one tool too late. The watcher is the half that reaches
+// inside, and the tool's own account of what it did still reaches the log.
+func TestTheWatcherStopsAToolAlreadyRunning(t *testing.T) {
+	cancels := NewLocalCancels()
+	running := make(chan struct{})
+	registry := registryWith(t, "wait", func(ctx context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		close(running)
+		<-ctx.Done()
+		return &mcp.CallToolResult{
+			IsError: true,
+			Content: []mcp.Content{&mcp.TextContent{Text: "stopped before the rollout finished"}},
+		}, nil
+	})
+
+	store := openArcStore(t)
+	chat, err := NewAgent(nil, registry, &scriptedLLM{replies: []*LLMResponse{
+		{ModelID: "gpt-5", ToolCalls: []LLMToolCall{{VendorID: "call_abc", ToolName: "wait"}}},
+	}})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	worker, err := NewArcWorker(store, store, chat, nil, WithCancelWatcher(cancels))
+	if err != nil {
+		t.Fatalf("NewArcWorker: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := worker.Work(context.Background(), testRef())
+		done <- err
+	}()
+
+	<-running
+	if err := cancels.NotifyCancel(context.Background(), testRef()); err != nil {
+		t.Fatalf("NotifyCancel: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Work returned %v, want the cancellation", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the tool was never stopped")
+	}
+
+	want := "USER_MESSAGE, ASSISTANT_MESSAGE, TOOL_CALL, TOOL_DISPATCHED, TOOL_RESULT"
+	if got := store.types(); got != want {
+		t.Fatalf("log = %s, want %s", got, want)
+	}
+}
+
+// Watching an arc that is cancelled later and one that is not must not be
+// confused, or a cancel stops a run on a different arc.
+func TestNotifyingOneArcLeavesAnotherAlone(t *testing.T) {
+	cancels := NewLocalCancels()
+	mine, stopMine := cancels.Watch(context.Background(), testRef())
+	defer stopMine()
+	theirs, stopTheirs := cancels.Watch(context.Background(), ArcRef{SessionID: testSessionID, ArcID: "arc-2"})
+	defer stopTheirs()
+
+	if err := cancels.NotifyCancel(context.Background(), testRef()); err != nil {
+		t.Fatalf("NotifyCancel: %v", err)
+	}
+
+	select {
+	case <-mine:
+	case <-time.After(time.Second):
+		t.Error("the cancelled arc's watcher was not told")
+	}
+	select {
+	case <-theirs:
+		t.Error("another arc's watcher was told")
+	default:
+	}
+}
+
+// A watcher that stops after the cancel must not close a channel twice, and
+// one that stops before it must not be told at all.
+func TestStoppingAWatchIsSafeEitherSideOfTheCancel(t *testing.T) {
+	cancels := NewLocalCancels()
+
+	_, stopFirst := cancels.Watch(context.Background(), testRef())
+	if err := cancels.NotifyCancel(context.Background(), testRef()); err != nil {
+		t.Fatalf("NotifyCancel: %v", err)
+	}
+	stopFirst()
+
+	left, stopSecond := cancels.Watch(context.Background(), testRef())
+	stopSecond()
+	if err := cancels.NotifyCancel(context.Background(), testRef()); err != nil {
+		t.Fatalf("NotifyCancel: %v", err)
+	}
+	select {
+	case <-left:
+		t.Error("a watch that was stopped was still told")
+	default:
+	}
 }

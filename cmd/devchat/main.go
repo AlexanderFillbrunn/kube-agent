@@ -104,19 +104,26 @@ func run(storePath, modelName, baseURL, systemPrompt, userID string) error {
 	// One worker for the process, so that a person's turn, a task's report
 	// and anything else that enters an arc contend for the same lease. The
 	// session arrives with the arc rather than being built in.
+	//
+	// The cancels go through the same halves a deployed one would: the session
+	// announces, the worker watches. In one process they could have been the
+	// run's own CancelFunc, but then the harness would exercise a path nothing
+	// else has.
+	cancels := agent.NewLocalCancels()
 	worker, err := agent.NewArcWorker(persistor, store, chat, agent.NewLocalLease(),
-		agent.WithTokenSink(screenTokens{relay: relay}))
+		agent.WithTokenSink(screenTokens{relay: relay}),
+		agent.WithCancelWatcher(cancels))
 	if err != nil {
 		return err
 	}
 
 	session := &session{
-		id:         storePath,
-		store:      store,
-		persistor:  persistor,
-		worker:     worker,
-		actor:      users.Actor{UserID: userID, TenantID: "dev"},
-		controller: runner,
+		id:        storePath,
+		store:     store,
+		persistor: persistor,
+		worker:    worker,
+		cancels:   cancels,
+		actor:     users.Actor{UserID: userID, TenantID: "dev"},
 	}
 
 	// The inbound half. A task calls this rather than writing to the log, which

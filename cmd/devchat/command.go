@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -100,7 +101,8 @@ func cancelTurn(m model, reason string) (model, tea.Cmd) {
 		return m.refresh(), nil
 	}
 
-	if err := m.session.cancel(context.Background(), m.arc, reason); err != nil {
+	arc := m.arc
+	if err := m.session.cancel(context.Background(), arc, reason); err != nil {
 		// The run is left alone. A cancel that was not recorded would stop the
 		// run and leave the log saying the arc is still being worked on, and a
 		// stuck run is easier to explain than a log that disagrees with it.
@@ -108,6 +110,12 @@ func cancelTurn(m model, reason string) (model, tea.Cmd) {
 		return m.refresh(), nil
 	}
 	m.cancel()
+
+	// The arc is owed one more run. The tasks it started have not been told to
+	// stop, and the worker is what tells them.
+	if !slices.Contains(m.owed, arc) {
+		m.owed = append(m.owed, arc)
+	}
 
 	return m.refresh(), nil
 }

@@ -21,6 +21,11 @@ type TaskReport struct {
 	// Message is what a notification or an input request says.
 	Message string
 
+	// RequestID names an input request, and is the ID its event is written
+	// under. A task mints it before it asks, because the answer comes back
+	// naming it and the task has to recognise which question it answers.
+	RequestID string
+
 	// Payload is what a notification carries, where it carries structure
 	// rather than a sentence.
 	Payload any
@@ -111,6 +116,12 @@ func reportEvent(ref TaskRef, report TaskReport) (*events.Event, error) {
 		ev.Payload = events.AsyncTaskEventPayload{CausationID: ref.ID, Payload: payload}
 
 	case TaskReportInputRequested:
+		if report.RequestID == "" {
+			return nil, fmt.Errorf("task %s asked for input without naming the request", ref.ID)
+		}
+		// The task named the request, so the event is written under that name
+		// rather than one the store mints.
+		ev.ID = report.RequestID
 		ev.Typ = events.AsyncTaskInputRequestedEventType
 		ev.Payload = events.AsyncTaskInputRequestedPayload{CausationID: ref.ID, Message: report.Message}
 

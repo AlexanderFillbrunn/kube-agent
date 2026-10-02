@@ -105,10 +105,11 @@ func (s *Store) Close() error {
 
 // Persist writes events and returns them as they were stored. The sequence
 // number is the store's to assign, since nothing outside the lock knows the
-// position in the log.
+// position in the log, and it is the only thing the store assigns.
 //
-// An ID and a timestamp are filled in only where the caller left them empty,
-// which a caller writing through agent.MintIdentity never does.
+// An event arrives named and timed, which is agent.MintIdentity's job on the
+// way in. One that does not is a bug in the writer and is refused, since a log
+// line with no ID is one nothing can refer to afterwards.
 //
 // A batch is one write and one sync, and the sequence number only advances
 // once it is on disk. That is as close to atomic as a file gets: a write that
@@ -126,15 +127,16 @@ func (s *Store) Persist(_ context.Context, evs ...*events.Event) ([]*events.Even
 	stored := make([]*events.Event, 0, len(evs))
 	var lines []byte
 	for _, ev := range evs {
+		if ev.ID == "" {
+			return nil, fmt.Errorf("%s event has no ID", ev.Typ)
+		}
+		if ev.Timestamp.IsZero() {
+			return nil, fmt.Errorf("%s event %s has no timestamp", ev.Typ, ev.ID)
+		}
+		// The caller's event is left alone, since they may still be holding it.
 		one := *ev
 		seq++
 		one.Seq = seq
-		if one.ID == "" {
-			one.ID = NewID()
-		}
-		if one.Timestamp.IsZero() {
-			one.Timestamp = time.Now().UTC()
-		}
 
 		line, err := json.Marshal(&one)
 		if err != nil {

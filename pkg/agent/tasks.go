@@ -44,7 +44,9 @@ type TaskRef struct {
 type Starter func(ctx context.Context, ref TaskRef, args any) error
 
 // TaskController reaches a task that is already running. It says how to talk
-// to a task, never what a task is doing, which is the log's to answer.
+// to a task, never what a task is doing, which is the log's to answer. What it
+// returns is the fate of one call and nothing more: a refusal is not a status
+// report, and a caller learns from it only that its own call got nowhere.
 //
 // Both methods may be called for a task that has already finished. An
 // implementation that cannot find the task returns an error.
@@ -53,8 +55,16 @@ type TaskController interface {
 	// work already under way is the runner's to report.
 	Cancel(ctx context.Context, ref TaskRef, reason string) error
 
-	// ProvideInput hands a waiting task what it asked for.
-	ProvideInput(ctx context.Context, ref TaskRef, input string) error
+	// ProvideInput hands a waiting task what it asked for. requestID is the
+	// request being answered, which a task mints before it asks and the
+	// INPUT_REQUESTED event is written under.
+	//
+	// It must be refused unless the task is still waiting on that request, so
+	// a second answer to one question is turned away rather than delivered
+	// twice. Only the implementation can decide this. A caller decides from a
+	// replay taken before it called, and two callers holding an answer to the
+	// same question both read that the task was waiting.
+	ProvideInput(ctx context.Context, ref TaskRef, requestID, input string) error
 }
 
 // TaskDefinition is one kind of task: how the model is offered it, and how one

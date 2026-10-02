@@ -20,6 +20,7 @@ import (
 type fakeController struct {
 	cancelled []TaskRef
 	inputs    []string
+	requests  []string
 	refs      []TaskRef
 	failure   error
 }
@@ -32,11 +33,12 @@ func (c *fakeController) Cancel(_ context.Context, ref TaskRef, _ string) error 
 	return nil
 }
 
-func (c *fakeController) ProvideInput(_ context.Context, ref TaskRef, input string) error {
+func (c *fakeController) ProvideInput(_ context.Context, ref TaskRef, requestID, input string) error {
 	if c.failure != nil {
 		return c.failure
 	}
 	c.refs = append(c.refs, ref)
+	c.requests = append(c.requests, requestID)
 	c.inputs = append(c.inputs, input)
 	return nil
 }
@@ -359,6 +361,10 @@ func TestInputIsGivenToTheTaskBeforeItIsRecorded(t *testing.T) {
 	if len(controller.inputs) != 1 || controller.inputs[0] != "kube-system" {
 		t.Fatalf("inputs = %#v, want the one answer", controller.inputs)
 	}
+	// The answer names the question, so a task that has moved on can refuse it.
+	if len(controller.requests) != 1 || controller.requests[0] != "ask-1" {
+		t.Errorf("requests = %#v, want the question the task is stopped at", controller.requests)
+	}
 
 	recorded := persistor.persisted[3]
 	if recorded.CorrelationID == nil || *recorded.CorrelationID != testArcID {
@@ -387,8 +393,8 @@ func TestInputThatNeverReachedTheTaskIsNotRecorded(t *testing.T) {
 	if status := h.Arcs[0].AsyncTasks[0].Status; status != history.AsyncTaskWaiting {
 		t.Errorf("task is %s, want it still waiting", status)
 	}
-	if text := resultText(t, lastCallIn(t, h, "arc-2")); !strings.Contains(text, "could not be reached") {
-		t.Errorf("result = %q, want it to say the task was not reached", text)
+	if text := resultText(t, lastCallIn(t, h, "arc-2")); !strings.Contains(text, "did not take the input") {
+		t.Errorf("result = %q, want it to say the input did not land", text)
 	}
 }
 

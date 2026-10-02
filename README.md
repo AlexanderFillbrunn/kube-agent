@@ -27,7 +27,7 @@ The rest are proposals rather than specifications:
 The code follows none of them in full, and several are partly built: the log
 and the projection carry interrupts already but nothing raises one, an arc is
 re-entered under a lease but no queue drives it, and a cancel is recorded and
-guarded but reaches nothing already under way.
+guarded and reaches a run in this process, but nothing further.
 
 Development harness
 --------------------

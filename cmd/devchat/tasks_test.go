@@ -70,7 +70,9 @@ func newHarness(t *testing.T, replies ...*agent.LLMResponse) *harness {
 	}
 
 	persistor := agent.MintIdentity(agent.GuardCancellation(store, store))
-	worker, err := agent.NewArcWorker(persistor, store, chat, agent.NewLocalLease())
+	cancels := agent.NewLocalCancels()
+	worker, err := agent.NewArcWorker(persistor, store, chat, agent.NewLocalLease(),
+		agent.WithCancelWatcher(cancels))
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
@@ -86,12 +88,12 @@ func newHarness(t *testing.T, replies ...*agent.LLMResponse) *harness {
 		runner:  runner,
 		llm:     llm,
 		session: &session{
-			id:         path,
-			store:      store,
-			persistor:  persistor,
-			worker:     worker,
-			actor:      users.Actor{UserID: "dev", TenantID: "dev"},
-			controller: runner,
+			id:        path,
+			store:     store,
+			persistor: persistor,
+			worker:    worker,
+			cancels:   cancels,
+			actor:     users.Actor{UserID: "dev", TenantID: "dev"},
 		},
 	}
 }
@@ -259,6 +261,13 @@ func TestCancellingAnArcStopsItsTask(t *testing.T) {
 		t.Fatalf("cancel: %v", err)
 	}
 
+	// The cancel is recorded and announced, and neither reaches a task running
+	// somewhere else. That is the worker's, so the arc is owed the run that
+	// does it, which is what the interface queues after a cancel.
+	if _, err := h.session.worker.Work(ctx, h.session.ref(arc)); err != nil {
+		t.Fatalf("Work: %v", err)
+	}
+
 	folded := h.waitFor(t, "the task to report that it stopped", func(folded *history.History) bool {
 		task := firstTask(folded)
 		return task != nil && task.FinishedSeq != nil
@@ -310,5 +319,42 @@ func TestReopeningALogSettlesAbandonedTasks(t *testing.T) {
 	}
 	if result, _ := task.Result.(string); !strings.Contains(result, "not known") {
 		t.Errorf("result = %q, want it to say whether the work happened is not known", result)
+	}
+}
+
+// Two answers to one question, which is what two arcs holding the same answer
+// produce. Only the runner can tell them apart: each caller decided from a
+// replay taken before it called, and both read that the task was waiting.
+func TestOnlyTheFirstAnswerToAQuestionReachesTheTask(t *testing.T) {
+	tasks := newLocalTasks()
+	ref := agent.TaskRef{ID: "task-1"}
+	tasks.running[ref.ID] = &localTask{input: make(chan string, 1)}
+	tasks.await(ref.ID, "ask-1")
+
+	if err := tasks.ProvideInput(context.Background(), ref, "ask-1", "kube-system"); err != nil {
+		t.Fatalf("first answer: %v", err)
+	}
+	if err := tasks.ProvideInput(context.Background(), ref, "ask-1", "ingress"); err == nil {
+		t.Fatal("the second answer to one question was accepted")
+	}
+
+	if got := <-tasks.running[ref.ID].input; got != "kube-system" {
+		t.Errorf("the task was given %q, want the answer that arrived first", got)
+	}
+}
+
+// An answer to a question the task has already moved past is refused, rather
+// than taken for the one it is waiting on now.
+func TestAnAnswerToASupersededQuestionIsRefused(t *testing.T) {
+	tasks := newLocalTasks()
+	ref := agent.TaskRef{ID: "task-1"}
+	tasks.running[ref.ID] = &localTask{input: make(chan string, 1)}
+	tasks.await(ref.ID, "ask-2")
+
+	if err := tasks.ProvideInput(context.Background(), ref, "ask-1", "kube-system"); err == nil {
+		t.Fatal("an answer to the wrong question was accepted")
+	}
+	if len(tasks.running[ref.ID].input) != 0 {
+		t.Error("the task was handed input it had not asked for")
 	}
 }

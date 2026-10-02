@@ -108,6 +108,10 @@ type ArcWorker struct {
 	// tokens follows a reply as it is written, and is nil for a worker nobody
 	// is watching, which is every worker with no interface attached.
 	tokens TokenSink
+
+	// cancels stops a run that is already inside a tool or a stream, and is
+	// nil for a worker that only stops between steps.
+	cancels CancelWatcher
 }
 
 // ArcWorkerOption configures parts of a worker that not every worker has.
@@ -116,6 +120,13 @@ type ArcWorkerOption func(*ArcWorker)
 // WithTokenSink gives a worker somewhere to stream replies as they arrive.
 func WithTokenSink(tokens TokenSink) ArcWorkerOption {
 	return func(w *ArcWorker) { w.tokens = tokens }
+}
+
+// WithCancelWatcher lets a cancel reach work the run has already started.
+// Without one a run stops at its next guarded write, which is the tool or the
+// task after the one it is in.
+func WithCancelWatcher(cancels CancelWatcher) ArcWorkerOption {
+	return func(w *ArcWorker) { w.cancels = cancels }
 }
 
 // NewArcWorker builds a worker from the parts a run is made of. A nil lease
@@ -147,6 +158,9 @@ func (w *ArcWorker) Work(ctx context.Context, ref ArcRef) (bool, error) {
 	}
 	defer release()
 
+	ctx, stop := w.watchForCancel(ctx, ref)
+	defer stop()
+
 	h, err := w.arcHistory(ctx, ref)
 	if err != nil {
 		return false, err
@@ -157,6 +171,36 @@ func (w *ArcWorker) Work(ctx context.Context, ref ArcRef) (bool, error) {
 		ArcID:     ref.ArcID,
 		Tokens:    w.tokenSink(ctx, ref),
 	})
+}
+
+// watchForCancel derives the context the run is stopped through, and a stop to
+// call when the run is over.
+//
+// It subscribes before the caller replays the arc. A cancel written before
+// this point is in what the replay reads, and one written after it is
+// delivered here, so nothing falls between the two. A watcher that misses it
+// anyway only costs latency, because the guard still refuses the run's next
+// guarded write.
+func (w *ArcWorker) watchForCancel(ctx context.Context, ref ArcRef) (context.Context, func()) {
+	if w.cancels == nil {
+		return ctx, func() {}
+	}
+
+	cancelled, unwatch := w.cancels.Watch(ctx, ref)
+	ctx, abort := context.WithCancel(ctx)
+	go func() {
+		select {
+		case <-cancelled:
+			abort()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, func() {
+		// The context is cancelled first, so the goroutine is on its way out
+		// before the subscription it was watching goes away.
+		abort()
+		unwatch()
+	}
 }
 
 // tokenSink labels what the agent streams with the arc it is streaming for.

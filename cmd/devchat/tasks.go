@@ -49,6 +49,12 @@ type localTasks struct {
 type localTask struct {
 	input  chan string
 	cancel context.CancelFunc
+
+	// awaiting is the request the task has stopped at, and is empty whenever
+	// it is not waiting for anything. It is read and cleared under
+	// localTasks.mu, so of two answers to one question only the first finds
+	// it there.
+	awaiting string
 }
 
 func newLocalTasks() *localTasks {
@@ -106,17 +112,36 @@ func (l *localTasks) Cancel(_ context.Context, ref agent.TaskRef, _ string) erro
 	return nil
 }
 
-// ProvideInput hands a waiting audit its answer.
-func (l *localTasks) ProvideInput(_ context.Context, ref agent.TaskRef, input string) error {
-	task, ok := l.lookup(ref.ID)
+// ProvideInput hands a waiting audit its answer, and refuses an answer to a
+// question it has moved on from. This is the only place that can: whoever
+// calls decided from a replay taken before the call.
+func (l *localTasks) ProvideInput(_ context.Context, ref agent.TaskRef, requestID, input string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	task, ok := l.running[ref.ID]
 	if !ok {
 		return fmt.Errorf("task %s is not running here", ref.ID)
 	}
-	select {
-	case task.input <- input:
-		return nil
-	default:
-		return fmt.Errorf("task %s is not waiting for input", ref.ID)
+	if task.awaiting != requestID {
+		return fmt.Errorf("task %s is not waiting on request %s", ref.ID, requestID)
+	}
+
+	// Clearing the request first is what makes the refusal exact. The channel
+	// is buffered and a task asks again only once it has taken the last
+	// answer, so the send cannot block under the lock.
+	task.awaiting = ""
+	task.input <- input
+	return nil
+}
+
+// await records which question a task has stopped at, so an answer to it can
+// be told from an answer to one it has already taken.
+func (l *localTasks) await(id, requestID string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if task, ok := l.running[id]; ok {
+		task.awaiting = requestID
 	}
 }
 
@@ -145,8 +170,13 @@ func (l *localTasks) audit(ctx context.Context, ref agent.TaskRef, task *localTa
 	l.report(ref, agent.TaskReport{
 		Kind: agent.TaskReportNotification, Message: "scanned 41 namespaces, 3 look busy"})
 
+	// The request is named and taken up before it is filed, because filing it
+	// works the arc, and the answer can be back before report returns.
+	requestID := agent.NewEventID()
+	l.await(ref.ID, requestID)
 	l.report(ref, agent.TaskReport{
-		Kind: agent.TaskReportInputRequested, Message: "which of kube-system, ingress or data should I look at in detail?"})
+		Kind: agent.TaskReportInputRequested, RequestID: requestID,
+		Message: "which of kube-system, ingress or data should I look at in detail?"})
 
 	var chosen string
 	select {

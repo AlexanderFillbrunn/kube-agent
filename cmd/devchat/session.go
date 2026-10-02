@@ -28,11 +28,12 @@ type session struct {
 	// person's turn acquires it like everything else that enters an arc.
 	worker *agent.ArcWorker
 
-	actor users.Actor
+	// cancels tells a run in progress that its arc was withdrawn, which is what
+	// reaches a tool already running. It is nil for a session that only stops
+	// runs between steps.
+	cancels agent.CancelNotifier
 
-	// controller reaches the tasks an arc started, so that stopping the arc
-	// stops them too. It is nil for a session with no tasks.
-	controller agent.TaskController
+	actor users.Actor
 }
 
 // newArcID mints the identifier for an arc about to be opened. The caller
@@ -76,9 +77,16 @@ func (s *session) turn(ctx context.Context, arcID, message string) error {
 // cancel records that the user withdrew an arc. Writing it is the caller's
 // job, since only they can name the actor.
 //
-// Stopping the run is separate and both are needed: the record is what the log
-// and the next projection read, and the context is what interrupts a running
-// tool. The context here is not the run's, which is about to be cancelled.
+// The record goes down first, because it is what the log and the next
+// projection read and it is the only durable part. Telling the run is second
+// and may fail: a run that hears nothing stops at its next guarded write
+// anyway.
+//
+// The tasks the arc started are not stopped here. Nobody who cancels is in a
+// position to reach work running somewhere else, so that is the worker's, and
+// the arc is owed a run for it.
+//
+// The context here is not the run's, which is about to be cancelled.
 func (s *session) cancel(ctx context.Context, arcID, reason string) error {
 	payload := events.CancelPayload{}
 	if reason != "" {
@@ -93,35 +101,10 @@ func (s *session) cancel(ctx context.Context, arcID, reason string) error {
 	}); err != nil {
 		return err
 	}
-	return s.stopTasks(ctx, arcID, reason)
-}
-
-// stopTasks asks whatever the arc started to stop. Which tasks those are is
-// read from the log, and nothing is written: what became of work already under
-// way is the runner's to report.
-//
-// A task that cannot be reached does not fail the cancel.
-func (s *session) stopTasks(ctx context.Context, arcID, reason string) error {
-	if s.controller == nil {
+	if s.cancels == nil {
 		return nil
 	}
-	h, err := s.arcHistory(ctx, arcID)
-	if err != nil {
-		return err
-	}
-	for _, arc := range h.Arcs {
-		if arc.ID != arcID {
-			continue
-		}
-		for _, task := range arc.AsyncTasks {
-			if task.FinishedSeq != nil {
-				continue
-			}
-			ref := agent.TaskRef{ArcRef: s.ref(arc.ID), ID: task.ID, Name: task.TaskName}
-			_ = s.controller.Cancel(ctx, ref, reason)
-		}
-	}
-	return nil
+	return s.cancels.NotifyCancel(ctx, s.ref(arcID))
 }
 
 // arcHistory loads and folds the events one arc is run from.

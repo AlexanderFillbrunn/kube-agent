@@ -93,16 +93,18 @@ func (p *publishingPersistor) Persist(ctx context.Context, evs ...*events.Event)
 	return stored, nil
 }
 
-// MintIdentity gives an event an ID and a timestamp.
+// MintIdentity gives an event an ID and a timestamp. Every write goes through
+// one of these, because a store is left to assign the sequence number and
+// nothing else.
 //
-// It does not give it a session. Every writer names the session it writes for,
-// since the agent's comes from the history it was handed and nothing in the
-// chain is tied to one session any more. An event that arrives without one is
-// a bug in the writer, and is refused rather than filled in.
+// It does not give an event a session. Every writer names the session it
+// writes for, since nothing in the chain is tied to one session any more, and
+// an event that arrives without one is a bug in the writer rather than
+// something to fill in.
 //
 // The timestamp is taken here rather than at the append, so two events can
 // carry times in the opposite order to their sequence numbers. The sequence
-// number is the order, and stays the store's to assign.
+// number is the order.
 func MintIdentity(persistor EventPersistor) EventPersistor {
 	return &mintingPersistor{persistor: persistor}
 }

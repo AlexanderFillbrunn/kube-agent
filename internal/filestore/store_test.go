@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"fillbrunn.ai/kube-agent/pkg/agent"
 	"fillbrunn.ai/kube-agent/pkg/events"
@@ -21,11 +22,14 @@ func openTemp(t *testing.T) *Store {
 	return store
 }
 
-// userMessage opens an arc.
+// userMessage opens an arc. It arrives named and timed, as everything written
+// through agent.MintIdentity does.
 func userMessage(arcID, content string) *events.Event {
 	actor := users.Actor{UserID: "dev", TenantID: "dev"}
 	return &events.Event{
 		SessionID:     "session",
+		ID:            NewID(),
+		Timestamp:     time.Now().UTC(),
 		Typ:           events.UserMessageEventType,
 		CorrelationID: &arcID,
 		Actor:         actor,
@@ -36,37 +40,57 @@ func userMessage(arcID, content string) *events.Event {
 func assistantMessage(arcID, content string) *events.Event {
 	return &events.Event{
 		SessionID:     "session",
+		ID:            NewID(),
+		Timestamp:     time.Now().UTC(),
 		Typ:           events.AssistantMessageEventType,
 		CorrelationID: &arcID,
 		Payload:       events.AssistantMessagePayload{ModelID: "gpt-5", Content: content},
 	}
 }
 
-func TestPersistAssignsIdentityFromZero(t *testing.T) {
+func TestPersistNumbersFromZero(t *testing.T) {
 	store := openTemp(t)
 
 	writtenFirst, err := store.Persist(context.Background(), userMessage("arc-1", "hello"))
 	if err != nil {
 		t.Fatalf("Persist: %v", err)
 	}
-	first := writtenFirst[0]
-	if first.Seq != 0 {
+	if first := writtenFirst[0]; first.Seq != 0 {
 		t.Errorf("first event is seq %d, want 0", first.Seq)
-	}
-	if first.ID == "" || first.Timestamp.IsZero() {
-		t.Errorf("event stored without an identity: %+v", first)
 	}
 
 	writtenSecond, err := store.Persist(context.Background(), assistantMessage("arc-1", "hi"))
 	if err != nil {
 		t.Fatalf("Persist: %v", err)
 	}
-	second := writtenSecond[0]
-	if second.Seq != 1 {
+	if second := writtenSecond[0]; second.Seq != 1 {
 		t.Errorf("second event is seq %d, want 1", second.Seq)
 	}
-	if second.ID == first.ID {
-		t.Error("two events share an ID")
+}
+
+// The store assigns the sequence number and nothing else, so an event that
+// arrives unnamed or untimed is refused rather than written as it came.
+func TestPersistRefusesAnEventWithoutAnIdentity(t *testing.T) {
+	store := openTemp(t)
+
+	unnamed := userMessage("arc-1", "hello")
+	unnamed.ID = ""
+	if _, err := store.Persist(context.Background(), unnamed); err == nil {
+		t.Error("an event with no ID was written")
+	}
+
+	untimed := userMessage("arc-1", "hello")
+	untimed.Timestamp = time.Time{}
+	if _, err := store.Persist(context.Background(), untimed); err == nil {
+		t.Error("an event with no timestamp was written")
+	}
+
+	stored, err := store.Events(context.Background())
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if len(stored) != 0 {
+		t.Errorf("the log holds %d events, want none", len(stored))
 	}
 }
 

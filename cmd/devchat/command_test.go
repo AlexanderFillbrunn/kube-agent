@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"fillbrunn.ai/kube-agent/internal/filestore"
 	"fillbrunn.ai/kube-agent/pkg/agent"
@@ -33,7 +34,8 @@ func TestClearStartsANewLogAndKeepsTheOld(t *testing.T) {
 	arc := "arc-1"
 	actor := users.Actor{UserID: "dev", TenantID: "dev"}
 	if _, err := store.Persist(context.Background(), &events.Event{
-		SessionID: "session", Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
+		SessionID: "session", ID: filestore.NewID(), Timestamp: time.Now().UTC(),
+		Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
 		Payload: events.UserMessagePayload{Content: "what is pending?", Actor: actor},
 	}); err != nil {
 		t.Fatalf("Persist: %v", err)
@@ -52,7 +54,8 @@ func TestClearStartsANewLogAndKeepsTheOld(t *testing.T) {
 	// The next event starts the numbering over, which is what the fold of a
 	// fresh history expects.
 	written, err := store.Persist(context.Background(), &events.Event{
-		SessionID: "session", Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
+		SessionID: "session", ID: filestore.NewID(), Timestamp: time.Now().UTC(),
+		Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
 		Payload: events.UserMessagePayload{Content: "again", Actor: actor},
 	})
 	if err != nil {

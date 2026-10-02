@@ -3,9 +3,10 @@ Cancellation
 
 Status
 --------------------
-Half built. The record and the guard are in the code and work across
-processes. The watcher is a proposal, and reaching work that runs somewhere
-else is specified by an interface nothing implements remotely.
+The record, the guard, the watcher and the reach into work elsewhere are all
+in the code. What is missing is distance: `LocalCancels` is the only
+`CancelWatcher` there is, so the watcher only crosses a goroutine, and
+`TaskController` has no implementation that reaches another process.
 
 Cancelling an arc is not one action. It is a record plus up to three reaches
 into work that is already under way, each with a different mechanism, and
@@ -41,10 +42,7 @@ The guard
 --------------------
 `GuardCancellation` wraps the worker's persistor and refuses writes that start
 work, reporting `ErrCancelled`. It reads the cancel afresh on every guarded
-write and remembers nothing: it used to cache the arcs it had refused, which
-raced between the runs sharing one persistor and saved about one read, since a
-refusal ends the run at the first dispatch it reaches. Only two events start
-work.
+write and remembers nothing between them. Only two events start work.
 
     TOOL_DISPATCHED      written immediately before a tool runs
     ASYNC_TASK_INVOKE    written immediately before a task is started
@@ -83,7 +81,8 @@ guard still stops the run at its next step. So a lost notification costs time
 and money, never correctness.
 
 Producer and consumer are separate, as with the queue. The canceller
-announces, the worker watches, and nothing holds both.
+announces, the worker watches, and nothing holds both. `LocalCancels` is both
+for one process, which is what `cmd/devchat` wires.
 
     // CancelNotifier tells watchers that an arc has been cancelled. It is
     // best effort: a failure here does not fail the cancel.
@@ -102,23 +101,10 @@ A channel rather than a derived context, so the context plumbing lives once in
 `ArcWorker` and not in every implementation.
 
 It hooks in `Work`, which is the one place every way into an arc passes and
-the only place that holds the run's context.
-
-    release, ok, err := w.lease.Acquire(ctx, ref)
-    ...
-    cancelled, stop := w.cancels.Watch(ctx, ref)
-    defer stop()
-    ctx, abort := context.WithCancel(ctx)
-    defer abort()
-    go func() {
-        select {
-        case <-cancelled:
-            abort()
-        case <-ctx.Done():
-        }
-    }()
-
-    h, err := w.arcHistory(ctx, ref)
+the only place that holds the run's context. `watchForCancel` takes the lease's
+context and hands back the one the run is stopped through, plus the stop to
+call when the run is over. A worker built without a watcher gets its context
+back unchanged and stops only between steps.
 
 The subscribe comes before the replay. A cancel written before the subscribe
 is in what the replay reads, and one written after it is delivered. Subscribing
@@ -144,27 +130,26 @@ Nothing about the interface needs to change for a remote task. An
 implementation that posts to a job API or publishes a message satisfies it as
 well as one that closes a channel.
 
-What has to change is who calls it. An arc with a running task and no pending
-agent work has no worker on it at all, because `deriveArcState` returns
-`ArcStateDone` while a task is unfinished. There is nobody to notice the
-cancel. So the reach has to be scheduled rather than assumed, and there are
-two ways to schedule it.
+The worker calls it. An arc with a running task and no pending agent work has
+no worker on it, because `deriveArcState` returns `ArcStateDone` while a task
+is unfinished, so there is nobody holding the arc to notice the cancel. The
+reach is scheduled instead: the cancel leaves the arc owed a run, a worker
+takes it, and stopping the arc's unfinished tasks is what working a cancelled
+arc means.
 
-    the canceller does it    every interface that can cancel also holds a
-                             TaskController, and a canceller that dies between
-                             the record and the calls leaves tasks running
+`Agent.Run` reaches `stopArcTasks` for an arc that carries a cancel, before the
+step loop, and asks every unfinished task to stop under the reason the cancel
+carried. That keeps task-reaching on the side that holds a registry and a
+controller, and it survives a canceller that stops after writing the record.
 
-    the worker does it       the cancel enqueues the arc, a worker claims it,
-                             and stopping the arc's unfinished tasks is part
-                             of working a cancelled arc
+It writes nothing and does not go through `recordFailure`: the arc is already
+closed, and a controller nobody could reach is not a second thing to record. A
+task that could not be reached fails the run, so whoever handed the arc over
+comes back with it. Asking a task to stop twice is harmless, which is what
+makes coming back safe.
 
-The second is the one to build. It keeps task-reaching on the side that
-already holds a registry and a controller, it survives a canceller that
-crashes after writing the record, and it retries for free: a `Cancel` that
-fails fails the run, the queue item is released, and it comes back.
-
-`cmd/devchat` does the first today, in `session.stopTasks`, which is why the
-arc's tasks are stopped by whoever typed the cancel.
+A cancel in `cmd/devchat` writes the record, announces it, and leaves the arc
+owed a run.
 
 Asking a task to stop is not settling it. The cancel ends the waiting, and
 what became of work already under way is the runner's to report. A task whose
@@ -172,14 +157,12 @@ runner never reports is settled by `SettleAbandonedTasks`.
 
 A cancel is a write like any other
 --------------------
-A cancel takes agent work away from an arc, so it is tempting to treat it as
-the one write that needs no run. Under the design above it is not: stopping
-the arc's tasks is work, and a worker has to be given the arc to do it.
+A cancel takes agent work away from an arc and leaves work of its own: the
+tasks it has to reach. So the invariant in [RE-ENTRY.md](RE-ENTRY.md) covers it
+like anything else. Write the record, notify the watchers, enqueue the arc.
 
-So the invariant in [RE-ENTRY.md](RE-ENTRY.md) holds unchanged. Write the
-record, notify the watchers, enqueue the arc. A cancelled arc with no
-unfinished tasks produces a run that replays and does nothing, which is the
-same cheap no-op the queue already deals in.
+A cancelled arc with no unfinished tasks produces a run that replays and does
+nothing, which is the same cheap no-op the queue already deals in.
 
 A stale item for a cancelled arc is harmless for the same reason. The worker
 replays, reads a status that is not pending, and returns.
@@ -198,9 +181,9 @@ restart failed is a model that restarts it again. `restartDeployment` in
 
 What a cancelled context reaches
 --------------------
-The watcher hands the agent a cancelled context in places that never saw one
-before, so which of its writes honour that context is a rule rather than a
-judgement per call site. It is the same rule the guard uses.
+The watcher reaches the agent as a cancelled context, so which of its writes
+honour that context is a rule rather than a judgement per call site. It is the
+same rule the guard uses.
 
     starts work      TOOL_DISPATCHED, ASYNC_TASK_INVOKE. Honours the cancel,
                      because not starting the work is the point
@@ -214,19 +197,18 @@ adds it to that list, which is the safe way round. A batch is governed as one:
 a single event that starts work makes the whole batch honour the cancel, the
 same way one such event makes the guard refuse the whole batch.
 
-What the rule is left holding is the losing case. A tool's result is the one
-write that says what the tool did, so a store honouring a cancelled context
-would turn a settled call into one nobody ever heard back from.
+What the rule holds is the losing case. A tool's result is the one write that
+says what the tool did, so a store honouring a cancelled context would turn a
+settled call into one nobody ever heard back from.
 
-The splitting case is not its job, because a context is the wrong tool for it.
-A reply and the calls it requested are one record, and a log holding only the
-message reads as an answer the model never gave, which the next run closes the
-arc on. Widening the context would only have closed the window a cancel opens,
-and leaves the ones a store error and a crash open. So they are written
-together instead: `EventPersistor.Persist` takes events in a batch and writes
-all of them or none, and `recordResponse` mints the message ID up front so the
-calls can name it before anything is written. `startTask` writes its dispatch
-and its invocation the same way.
+Events that say one thing together are kept together by the write rather than
+by the context, which covers a store error and a crash as well as a cancel.
+`EventPersistor.Persist` takes events in a batch and writes all of them or
+none. `recordResponse` uses it for a reply and the calls it requested, minting
+the message ID up front so the calls can name it before anything is written,
+and `startTask` for its dispatch and its invocation. A log holding only the
+message would read as an answer the model never gave, which the next run closes
+the arc on.
 
 The rule does not reach writes outside the agent. `TaskReports.Report` writes
 on the context of whoever is reporting, which has a different lifetime, and

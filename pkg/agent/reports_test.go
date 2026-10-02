@@ -141,7 +141,7 @@ func TestAnInputRequestGetsTheModelATurn(t *testing.T) {
 	reports := reportsFor(t, store, &LLMResponse{ModelID: "gpt-5", Content: "which namespace should I audit?"})
 
 	_, err := reports.Report(context.Background(), taskRef(), TaskReport{
-		Kind: TaskReportInputRequested, Message: "which namespace?"})
+		Kind: TaskReportInputRequested, RequestID: "ask-1", Message: "which namespace?"})
 	if err != nil {
 		t.Fatalf("Report: %v", err)
 	}
@@ -149,6 +149,45 @@ func TestAnInputRequestGetsTheModelATurn(t *testing.T) {
 	want := "USER_MESSAGE, ASSISTANT_MESSAGE, ASYNC_TASK_INVOKE, ASYNC_TASK_INPUT_REQUESTED, ASSISTANT_MESSAGE"
 	if got := store.types(); got != want {
 		t.Fatalf("log = %s, want %s", got, want)
+	}
+}
+
+// The question is written under the name the task gave it, which is how an
+// answer that names a request can be matched against the request outstanding.
+func TestAnInputRequestIsWrittenUnderTheNameTheTaskGaveIt(t *testing.T) {
+	store := runningTaskStore(t)
+	reports := reportsFor(t, store, &LLMResponse{ModelID: "gpt-5", Content: "which namespace should I audit?"})
+
+	if _, err := reports.Report(context.Background(), taskRef(), TaskReport{
+		Kind: TaskReportInputRequested, RequestID: "ask-1", Message: "which namespace?"}); err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+
+	for _, ev := range store.events {
+		if ev.Typ == events.AsyncTaskInputRequestedEventType {
+			if ev.ID != "ask-1" {
+				t.Fatalf("the question is %q, want the name the task minted", ev.ID)
+			}
+			return
+		}
+	}
+	t.Fatal("no question was written")
+}
+
+// A task that asks without naming the request is refused. Nothing but the task
+// can mint that name, since it has to recognise the answer when it comes back.
+func TestAnInputRequestWithoutARequestIDIsRefused(t *testing.T) {
+	store := runningTaskStore(t)
+	reports := reportsFor(t, store)
+
+	if _, err := reports.Report(context.Background(), taskRef(), TaskReport{
+		Kind: TaskReportInputRequested, Message: "which namespace?"}); err == nil {
+		t.Fatal("an unnamed request was accepted")
+	}
+
+	want := "USER_MESSAGE, ASSISTANT_MESSAGE, ASYNC_TASK_INVOKE"
+	if got := store.types(); got != want {
+		t.Errorf("wrote %s, want nothing beyond %s", got, want)
 	}
 }
 
