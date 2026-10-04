@@ -77,6 +77,7 @@ type StreamToken struct {
 	MessageID string
 
 	Content string
+	Seq int
 }
 
 // TokenSink takes a reply as it is written.
@@ -220,6 +221,7 @@ func (w *ArcWorker) tokenSink(ctx context.Context, ref ArcRef) Sink[Token] {
 			ArcID:     ref.ArcID,
 			MessageID: tok.MessageID,
 			Content:   tok.Content,
+			Seq: 	   tok.Seq,
 		})
 		return nil
 	})

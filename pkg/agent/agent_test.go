@@ -130,7 +130,7 @@ type scriptedLLM struct {
 	calls   int
 }
 
-func (l *scriptedLLM) StreamResponse(ctx context.Context, _ *history.History, _ *LLMOptions, _ Sink[string]) (*LLMResponse, error) {
+func (l *scriptedLLM) StreamResponse(ctx context.Context, _ *history.History, _ *LLMOptions, _ Sink[RawToken]) (*LLMResponse, error) {
 	if l.failure != nil {
 		l.calls++
 		return nil, l.failure
@@ -539,7 +539,7 @@ type cancellingLLM struct {
 	cancel context.CancelFunc
 }
 
-func (l *cancellingLLM) StreamResponse(_ context.Context, _ *history.History, _ *LLMOptions, _ Sink[string]) (*LLMResponse, error) {
+func (l *cancellingLLM) StreamResponse(_ context.Context, _ *history.History, _ *LLMOptions, _ Sink[RawToken]) (*LLMResponse, error) {
 	l.cancel()
 	return l.reply, nil
 }

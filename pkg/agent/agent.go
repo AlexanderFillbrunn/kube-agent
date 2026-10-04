@@ -25,6 +25,12 @@ const (
 	ArcStateClose	  arcState = iota
 )
 
+type Token struct {
+	MessageID string
+	Content   string
+	Seq		  int
+}
+
 // AgentConfig is what an agent is built with, and holds nothing that differs
 // from one run to the next. Following a run is not here: notification hangs
 // off the persistor, so an agent has no idea whether anybody is watching. See
@@ -349,10 +355,10 @@ func (a Agent) llmStep(ctx context.Context, state *agentState) error {
 //
 // The provider is handed a plain Sink[string], so no LLM implementation learns
 // what an arc or a message is.
-func (s *agentState) tokenSink(messageID string) Sink[string] {
-	return SinkFromFunc(func(text string) error {
+func (s *agentState) tokenSink(messageID string) Sink[RawToken] {
+	return SinkFromFunc(func(tok RawToken) error {
 		if s.tokens != nil {
-			_ = s.tokens.Consume(Token{MessageID: messageID, Content: text})
+			_ = s.tokens.Consume(Token{MessageID: messageID, Content: tok.Content, Seq: tok.Seq})
 		}
 		return nil
 	})

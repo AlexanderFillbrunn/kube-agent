@@ -15,9 +15,9 @@ type streamingLLM struct {
 	reply  *LLMResponse
 }
 
-func (l *streamingLLM) StreamResponse(_ context.Context, _ *history.History, _ *LLMOptions, tokens Sink[string]) (*LLMResponse, error) {
-	for _, piece := range l.pieces {
-		if err := tokens.Consume(piece); err != nil {
+func (l *streamingLLM) StreamResponse(_ context.Context, _ *history.History, _ *LLMOptions, tokens Sink[RawToken]) (*LLMResponse, error) {
+	for i, piece := range l.pieces {
+		if err := tokens.Consume(RawToken{Content: piece, Seq: i}); err != nil {
 			return nil, err
 		}
 	}
@@ -25,7 +25,7 @@ func (l *streamingLLM) StreamResponse(_ context.Context, _ *history.History, _ *
 }
 
 func (l *streamingLLM) Response(ctx context.Context, h *history.History, opts *LLMOptions) (*LLMResponse, error) {
-	return l.StreamResponse(ctx, h, opts, SinkFromFunc(func(string) error { return nil }))
+	return l.StreamResponse(ctx, h, opts, SinkFromFunc(func(RawToken) error { return nil }))
 }
 
 // A run nobody is watching streams into nothing and records the same log, so a

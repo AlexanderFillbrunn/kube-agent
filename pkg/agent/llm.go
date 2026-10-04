@@ -6,15 +6,16 @@ import (
 	"fillbrunn.ai/kube-agent/pkg/history"
 )
 
+// RawToken is a token emitted from the LLM during streaming.
+type RawToken struct {
+	Content string
+	Seq int
+}
+
 // LLMOptions holds information for an LLM to control how new prompts are handled.
 type LLMOptions struct {
 	SystemPrompt string
 	Tools        ToolSet
-}
-
-type Token struct {
-	MessageID string
-	Content   string
 }
 
 // LLMResponse is one reply from a model: what it said and the calls it asked
@@ -63,6 +64,6 @@ type LLMToolCall struct {
 
 // LLM represents a large language model with tool calling capabilities.
 type LLM interface {
-	StreamResponse(ctx context.Context, history *history.History, opts *LLMOptions, tokSink Sink[string]) (*LLMResponse, error)
+	StreamResponse(ctx context.Context, history *history.History, opts *LLMOptions, tokSink Sink[RawToken]) (*LLMResponse, error)
 	Response(ctx context.Context, history *history.History, opts *LLMOptions) (*LLMResponse, error)
 }

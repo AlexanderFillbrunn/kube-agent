@@ -67,10 +67,10 @@ func userArcHistory(t *testing.T) *history.History {
 	return h
 }
 
-func collectTokens() (*[]string, Sink[string]) {
+func collectTokens() (*[]string, Sink[RawToken]) {
 	var tokens []string
-	return &tokens, SinkFromFunc(func(tok string) error {
-		tokens = append(tokens, tok)
+	return &tokens, SinkFromFunc(func(tok RawToken) error {
+		tokens = append(tokens, tok.Content)
 		return nil
 	})
 }

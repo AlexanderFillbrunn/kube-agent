@@ -21,7 +21,7 @@ type scriptLLM struct {
 	calls   int
 }
 
-func (l *scriptLLM) StreamResponse(_ context.Context, _ *history.History, _ *agent.LLMOptions, _ agent.Sink[string]) (*agent.LLMResponse, error) {
+func (l *scriptLLM) StreamResponse(_ context.Context, _ *history.History, _ *agent.LLMOptions, _ agent.Sink[agent.RawToken]) (*agent.LLMResponse, error) {
 	if l.calls >= len(l.replies) {
 		return &agent.LLMResponse{ModelID: "test", Content: "(nothing scripted)"}, nil
 	}

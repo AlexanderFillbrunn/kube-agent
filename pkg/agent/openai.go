@@ -127,7 +127,7 @@ func (u *openAIUsage) tokenUsage() *TokenUsage {
 
 // StreamResponse asks the model for one response and streams its text to
 // tokSink as it arrives. The reply itself is returned whole.
-func (o *OpenAI) StreamResponse(ctx context.Context, h *history.History, opts *LLMOptions, tokSink Sink[string]) (*LLMResponse, error) {
+func (o *OpenAI) StreamResponse(ctx context.Context, h *history.History, opts *LLMOptions, tokSink Sink[RawToken]) (*LLMResponse, error) {
 	return o.respond(ctx, h, opts, tokSink)
 }
 
@@ -138,7 +138,7 @@ func (o *OpenAI) Response(ctx context.Context, h *history.History, opts *LLMOpti
 
 // respond runs one exchange. A nil tokSink means the response is not
 // streamed.
-func (o *OpenAI) respond(ctx context.Context, h *history.History, opts *LLMOptions, tokSink Sink[string]) (*LLMResponse, error) {
+func (o *OpenAI) respond(ctx context.Context, h *history.History, opts *LLMOptions, tokSink Sink[RawToken]) (*LLMResponse, error) {
 	if opts == nil {
 		opts = &LLMOptions{}
 	}
@@ -331,12 +331,22 @@ type openAIToolCallDelta struct {
 
 // readStream consumes the SSE stream, handing each text fragment to tokSink as
 // it arrives and assembling the completion behind it.
-func readStream(body io.Reader, tokSink Sink[string]) (*openAICompletion, error) {
+func readStream(body io.Reader, tokSink Sink[RawToken]) (*openAICompletion, error) {
 	completion := &openAICompletion{}
 	// Calls are keyed by their index rather than appended, because fragments
 	// of two parallel calls interleave.
 	calls := map[int]*openAIToolCall{}
 	var order []int
+
+	tokCounter := 0
+	sink := SinkFromFunc(func (s string) error {
+		tokSink.Consume(RawToken{
+			Content: s,
+			Seq: tokCounter,
+		})
+		tokCounter += 1
+		return nil
+	})
 
 	reader := bufio.NewReader(body)
 	for {
@@ -352,7 +362,7 @@ func readStream(body io.Reader, tokSink Sink[string]) (*openAICompletion, error)
 			if chunk.Error != nil {
 				return nil, fmt.Errorf("openai: %s", chunk.Error.Message)
 			}
-			if err := applyChunk(completion, calls, &order, chunk, tokSink); err != nil {
+			if err := applyChunk(completion, calls, &order, chunk, sink); err != nil {
 				return nil, err
 			}
 		}
