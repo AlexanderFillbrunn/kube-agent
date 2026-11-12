@@ -39,6 +39,24 @@ type ToolRegistry struct {
 	tools map[string]registeredTool
 }
 
+// ToolProvider is one source of tools: what the model is offered from it, and
+// how a call to one of those tools is run. A provider answers from its own
+// tools only, so several can be combined without one seeing another's.
+//
+// Which tools are safe to repeat is not here: it is written in the tool's own
+// annotations, so it is read by SafeToRepeat rather than asked of a source.
+type ToolProvider interface {
+	ToolSet
+
+	// Get returns one tool by name, for a caller that has to know how a call
+	// by that name would be made.
+	Get(tool string) (*mcp.Tool, bool)
+
+	// Invoke runs a tool and returns what it produced. See ToolRegistry.Invoke
+	// for what the returned error means.
+	Invoke(ctx context.Context, name string, args any) (ToolOutcome, error)
+}
+
 type registeredTool struct {
 	tool    *mcp.Tool
 	handler mcp.ToolHandler
@@ -87,12 +105,11 @@ func (r *ToolRegistry) All() []*mcp.Tool {
 // SafeToRepeat reports whether running a tool twice with the same arguments
 // is as good as running it once. It answers from the tool's own annotations,
 // so a tool that declares neither hint is not safe to repeat.
-func (r *ToolRegistry) SafeToRepeat(name string) bool {
-	tool, ok := r.tools[name]
-	if !ok || tool.tool.Annotations == nil {
+func SafeToRepeat(tool *mcp.Tool) bool {
+	if tool == nil || tool.Annotations == nil {
 		return false
 	}
-	return tool.tool.Annotations.ReadOnlyHint || tool.tool.Annotations.IdempotentHint
+	return tool.Annotations.ReadOnlyHint || tool.Annotations.IdempotentHint
 }
 
 // ToolOutcome is what a tool produced, in the terms the log records it in.

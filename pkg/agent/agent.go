@@ -41,7 +41,7 @@ type AgentConfig struct {
 
 type Agent struct {
 	config *AgentConfig
-	tools *ToolRegistry
+	tools ToolProvider
 	llm LLM
 
 	// tasks and controller are the two halves of async work: what may be
@@ -68,9 +68,9 @@ func WithTasks(tasks *TaskRegistry, controller TaskController) AgentOption {
 	}
 }
 
-// NewAgent builds an agent from the parts it runs on. A nil config or registry
-// means no system prompt and no tools. A model is required.
-func NewAgent(config *AgentConfig, tools *ToolRegistry, llm LLM, options ...AgentOption) (*Agent, error) {
+// NewAgent builds an agent from the parts it runs on. A nil config or tool
+// provider means no system prompt and an empty registry. A model is required.
+func NewAgent(config *AgentConfig, tools ToolProvider, llm LLM, options ...AgentOption) (*Agent, error) {
 	if llm == nil {
 		return nil, errors.New("an agent needs a model")
 	}
@@ -435,7 +435,8 @@ func (a Agent) toolStep(ctx context.Context, state *agentState) error {
 	for _, call := range pending {
 		// A call another run already dispatched may have taken effect. Only a
 		// tool declared safe to repeat gets a second attempt.
-		if call.Phase() == history.ToolCallPhaseDispatched && !a.tools.SafeToRepeat(call.ToolName) {
+		tool, ok := a.tools.Get(call.ToolName)
+		if call.Phase() == history.ToolCallPhaseDispatched && !(ok && SafeToRepeat(tool)) {
 			if err := a.abandonToolCall(ctx, call, state); err != nil {
 				return err
 			}

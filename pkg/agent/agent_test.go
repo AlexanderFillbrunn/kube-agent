@@ -684,11 +684,14 @@ func TestAFreshCallIsNotTreatedAsAbandoned(t *testing.T) {
 	if err := registry.RegisterTool(&mcp.Tool{Name: "list_pods"}, nil); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	if registry.SafeToRepeat("list_pods") {
+	if SafeToRepeat(&mcp.Tool{Name: "list_pods"}) {
 		t.Error("a tool with no annotations reads as safe to repeat")
 	}
-	if registry.SafeToRepeat("absent") {
-		t.Error("an unregistered tool reads as safe to repeat")
+	if SafeToRepeat(nil) {
+		t.Error("no tool at all reads as safe to repeat")
+	}
+	if !SafeToRepeat(&mcp.Tool{Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true}}) {
+		t.Error("a read-only tool reads as unsafe to repeat")
 	}
 }
 
