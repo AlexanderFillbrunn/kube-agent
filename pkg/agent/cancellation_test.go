@@ -61,7 +61,7 @@ func runGuarded(t *testing.T, cancels *cancelledArcs) (*history.History, *fakePe
 	}
 
 	h := userArcHistory(t)
-	runErr := agent.Run(context.Background(), RunOptions{Persistor: guarded, History: h, ArcID: testArcID})
+	runErr := agent.Run(context.Background(), RunOptions{AgentID: testAgentID, Persistor: guarded, History: h, ArcID: testArcID})
 	if ran && cancels.arcs[testArcID] != nil {
 		t.Error("the tool ran for a cancelled arc")
 	}
@@ -256,7 +256,7 @@ func workerOver(t *testing.T, store *logStore, controller TaskController, option
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
-	worker, err := NewArcWorker(store, store, agent, nil, options...)
+	worker, err := NewArcWorker(store, store, NewFixedResolver(agent), nil, options...)
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
@@ -270,7 +270,7 @@ func TestWorkingACancelledArcStopsItsTasks(t *testing.T) {
 	store := cancelledTaskArc(t, "changed my mind")
 	controller := &recordingController{}
 
-	worked, err := workerOver(t, store, controller).Work(context.Background(), testRef())
+	worked, err := workerOver(t, store, controller).Work(context.Background(), testRef(), testAgentID)
 	if err != nil {
 		t.Fatalf("Work: %v", err)
 	}
@@ -306,7 +306,7 @@ func TestATaskThatCannotBeStoppedFailsTheRunWithoutRecordingIt(t *testing.T) {
 	store := cancelledTaskArc(t, "changed my mind")
 	controller := &recordingController{err: errors.New("the runner is unreachable")}
 
-	_, err := workerOver(t, store, controller).Work(context.Background(), testRef())
+	_, err := workerOver(t, store, controller).Work(context.Background(), testRef(), testAgentID)
 	if err == nil {
 		t.Fatal("Work reported success although the task was never told")
 	}
@@ -330,7 +330,7 @@ func TestWorkingACancelledArcWithNoTasksDoesNothing(t *testing.T) {
 	}
 	controller := &recordingController{}
 
-	if _, err := workerOver(t, store, controller).Work(context.Background(), testRef()); err != nil {
+	if _, err := workerOver(t, store, controller).Work(context.Background(), testRef(), testAgentID); err != nil {
 		t.Fatalf("Work: %v", err)
 	}
 	if len(controller.stopped) != 0 {
@@ -374,14 +374,14 @@ func TestTheWatcherStopsAToolAlreadyRunning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
-	worker, err := NewArcWorker(store, store, chat, nil, WithCancelWatcher(cancels))
+	worker, err := NewArcWorker(store, store, NewFixedResolver(chat), nil, WithCancelWatcher(cancels))
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := worker.Work(context.Background(), testRef())
+		_, err := worker.Work(context.Background(), testRef(), testAgentID)
 		done <- err
 	}()
 

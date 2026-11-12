@@ -97,10 +97,11 @@ func (p *publishingPersistor) Persist(ctx context.Context, evs ...*events.Event)
 // one of these, because a store is left to assign the sequence number and
 // nothing else.
 //
-// It does not give an event a session. Every writer names the session it
-// writes for, since nothing in the chain is tied to one session any more, and
-// an event that arrives without one is a bug in the writer rather than
-// something to fill in.
+// It does not give an event a session or an agent. Every writer names the
+// session it writes for and the agent that added the event, since nothing in
+// the chain is tied to one session or one agent any more, and an event that
+// arrives without either is a bug in the writer rather than something to
+// fill in.
 //
 // The timestamp is taken here rather than at the append, so two events can
 // carry times in the opposite order to their sequence numbers. The sequence
@@ -119,6 +120,9 @@ func (m *mintingPersistor) Persist(ctx context.Context, evs ...*events.Event) ([
 		if ev.SessionID == "" {
 			return nil, fmt.Errorf("%s event names no session", ev.Typ)
 		}
+		if ev.AgentID == "" {
+			return nil, fmt.Errorf("%s event names no agent", ev.Typ)
+		}
 		// The caller's event is left alone, since they may still be holding it.
 		one := *ev
 		// An ID or a time already set is kept, which is how a caller ties two
@@ -132,6 +136,36 @@ func (m *mintingPersistor) Persist(ctx context.Context, evs ...*events.Event) ([
 		minted = append(minted, &one)
 	}
 	return m.persistor.Persist(ctx, minted...)
+}
+
+// AsAgent stamps every event written through it with the agent that added
+// it. An event already naming an agent is left alone, so a writer that knows
+// its agent keeps its own stamp, the same convention as the ID and the time in
+// MintIdentity.
+//
+// A run is handed one of these rather than its agent id, so an agent never
+// holds the id it runs under: the work item names the agent, the persistor
+// records it, and nothing between the two has to carry it.
+func AsAgent(agentID string, persistor EventPersistor) EventPersistor {
+	return &agentPersistor{agentID: agentID, persistor: persistor}
+}
+
+type agentPersistor struct {
+	agentID   string
+	persistor EventPersistor
+}
+
+func (a *agentPersistor) Persist(ctx context.Context, evs ...*events.Event) ([]*events.Event, error) {
+	stamped := make([]*events.Event, 0, len(evs))
+	for _, ev := range evs {
+		// The caller's event is left alone, since they may still be holding it.
+		one := *ev
+		if one.AgentID == "" {
+			one.AgentID = a.agentID
+		}
+		stamped = append(stamped, &one)
+	}
+	return a.persistor.Persist(ctx, stamped...)
 }
 
 // NewEventID mints an identifier for an event.

@@ -71,7 +71,7 @@ func newHarness(t *testing.T, replies ...*agent.LLMResponse) *harness {
 
 	persistor := agent.MintIdentity(agent.GuardCancellation(store, store))
 	cancels := agent.NewLocalCancels()
-	worker, err := agent.NewArcWorker(persistor, store, chat, agent.NewLocalLease(),
+	worker, err := agent.NewArcWorker(persistor, store, agent.NewFixedResolver(chat), agent.NewLocalLease(),
 		agent.WithCancelWatcher(cancels))
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
@@ -264,7 +264,7 @@ func TestCancellingAnArcStopsItsTask(t *testing.T) {
 	// The cancel is recorded and announced, and neither reaches a task running
 	// somewhere else. That is the worker's, so the arc is owed the run that
 	// does it, which is what the interface queues after a cancel.
-	if _, err := h.session.worker.Work(ctx, h.session.ref(arc)); err != nil {
+	if _, err := h.session.worker.Work(ctx, h.session.ref(arc), localAgentID); err != nil {
 		t.Fatalf("Work: %v", err)
 	}
 
@@ -285,11 +285,11 @@ func TestReopeningALogSettlesAbandonedTasks(t *testing.T) {
 	ctx := context.Background()
 	arc := "arc-1"
 	for _, ev := range []*events.Event{
-		{SessionID: h.session.id, Typ: events.UserMessageEventType, ID: arc, CorrelationID: &arc, Actor: h.session.actor,
+		{SessionID: h.session.id, AgentID: localAgentID, Typ: events.UserMessageEventType, ID: arc, CorrelationID: &arc, Actor: h.session.actor,
 			Payload: events.UserMessagePayload{Content: "audit the cluster", Actor: h.session.actor}},
-		{SessionID: h.session.id, Typ: events.AssistantMessageEventType, ID: "msg-1", CorrelationID: &arc,
+		{SessionID: h.session.id, AgentID: localAgentID, Typ: events.AssistantMessageEventType, ID: "msg-1", CorrelationID: &arc,
 			Payload: events.AssistantMessagePayload{ModelID: "test", Content: "running"}},
-		{SessionID: h.session.id, Typ: events.AsyncTaskInvokeEventType, ID: "task-1", CorrelationID: &arc,
+		{SessionID: h.session.id, AgentID: localAgentID, Typ: events.AsyncTaskInvokeEventType, ID: "task-1", CorrelationID: &arc,
 			Payload: events.AsyncTaskInvokePayload{TaskName: "audit_namespaces"}},
 	} {
 		if _, err := h.session.persistor.Persist(ctx, ev); err != nil {
@@ -301,7 +301,7 @@ func TestReopeningALogSettlesAbandonedTasks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read log: %v", err)
 	}
-	settled, err := agent.SettleAbandonedTasks(ctx, h.session.persistor, folded)
+	settled, err := agent.SettleAbandonedTasks(ctx, agent.AsAgent(localAgentID, h.session.persistor), folded)
 	if err != nil {
 		t.Fatalf("SettleAbandonedTasks: %v", err)
 	}

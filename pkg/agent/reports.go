@@ -69,6 +69,9 @@ func NewTaskReports(worker *ArcWorker) (*TaskReports, error) {
 // to do is decided by reading the log. A report naming an arc that does not
 // own the task is refused.
 func (r *TaskReports) Report(ctx context.Context, ref TaskRef, report TaskReport) (bool, error) {
+	if ref.AgentID == "" {
+		return false, fmt.Errorf("task %s reports under a ref naming no agent to work arc %s", ref.ID, ref.ArcID)
+	}
 	h, err := r.worker.arcHistory(ctx, ref.ArcRef)
 	if err != nil {
 		return false, err
@@ -81,11 +84,11 @@ func (r *TaskReports) Report(ctx context.Context, ref TaskRef, report TaskReport
 	if err != nil {
 		return false, err
 	}
-	if _, err := r.worker.persistor.Persist(ctx, ev); err != nil {
+	if _, err := AsAgent(ref.AgentID, r.worker.persistor).Persist(ctx, ev); err != nil {
 		return false, err
 	}
 
-	return r.worker.Work(ctx, ref.ArcRef)
+	return r.worker.Work(ctx, ref.ArcRef, ref.AgentID)
 }
 
 // holdsTask reports whether the arc named really owns the task named.

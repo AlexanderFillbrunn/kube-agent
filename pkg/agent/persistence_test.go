@@ -37,6 +37,7 @@ func TestMintIdentityKeepsTheWritersSession(t *testing.T) {
 	arcID := testArcID
 	written, err := persistor.Persist(context.Background(), &events.Event{
 		SessionID:     testSessionID,
+		AgentID:       testAgentID,
 		Typ:           events.UserMessageEventType,
 		CorrelationID: &arcID,
 		Payload:       events.UserMessagePayload{Content: "what is running?"},
@@ -61,6 +62,7 @@ func TestMintIdentityMintsAnIDAndATime(t *testing.T) {
 	before := time.Now().UTC()
 	writtenFirst, err := persistor.Persist(context.Background(), &events.Event{
 		SessionID: testSessionID,
+		AgentID:   testAgentID,
 		Typ:       events.UserMessageEventType,
 		Payload:   events.UserMessagePayload{Content: "what is running?"},
 	})
@@ -70,6 +72,7 @@ func TestMintIdentityMintsAnIDAndATime(t *testing.T) {
 	first := writtenFirst[0]
 	writtenSecond, err := persistor.Persist(context.Background(), &events.Event{
 		SessionID: testSessionID,
+		AgentID:   testAgentID,
 		Typ:       events.UserMessageEventType,
 		Payload:   events.UserMessagePayload{Content: "and now?"},
 	})
@@ -95,6 +98,7 @@ func TestMintIdentityKeepsWhatTheCallerSet(t *testing.T) {
 	at := time.Unix(1000, 0).UTC()
 	written, err := persistor.Persist(context.Background(), &events.Event{
 		SessionID: testSessionID,
+		AgentID:   testAgentID,
 		Typ:       events.UserMessageEventType,
 		ID:        "chosen-id",
 		Timestamp: at,
@@ -116,6 +120,7 @@ func TestMintIdentityLeavesTheCallersEventAlone(t *testing.T) {
 
 	original := &events.Event{
 		SessionID: testSessionID,
+		AgentID:   testAgentID,
 		Typ:       events.UserMessageEventType,
 		Payload:   events.UserMessagePayload{Content: "what is running?"},
 	}
@@ -170,7 +175,8 @@ func TestPublishEventsSaysNothingAboutAFailedWrite(t *testing.T) {
 
 	arcID := testArcID
 	if _, err := persistor.Persist(context.Background(), &events.Event{
-		SessionID: testSessionID, Typ: events.ArcClosedEventType, CorrelationID: &arcID,
+		SessionID: testSessionID,
+		AgentID:   testAgentID, Typ: events.ArcClosedEventType, CorrelationID: &arcID,
 		Payload: events.ArcClosedPayload{CausationID: "m"},
 	}); err == nil {
 		t.Fatal("a failed write was reported as a success")
@@ -193,7 +199,7 @@ func TestARunPublishesEverythingItWrites(t *testing.T) {
 	}
 
 	h := userArcHistory(t)
-	if err := agent.Run(context.Background(), RunOptions{
+	if err := agent.Run(context.Background(), RunOptions{AgentID: testAgentID, 
 		Persistor: PublishEvents(store, sink),
 		History:   h,
 		ArcID:     testArcID,
@@ -207,5 +213,24 @@ func TestARunPublishesEverythingItWrites(t *testing.T) {
 	}
 	if typesOf(published) != typesOf(store.persisted) {
 		t.Errorf("published %s, wrote %s", typesOf(published), typesOf(store.persisted))
+	}
+}
+
+func TestMintIdentityRefusesAnEventWithNoAgent(t *testing.T) {
+	store := &fakePersistor{}
+	persistor := MintIdentity(store)
+
+	arcID := testArcID
+	_, err := persistor.Persist(context.Background(), &events.Event{
+		SessionID:     testSessionID,
+		Typ:           events.UserMessageEventType,
+		CorrelationID: &arcID,
+		Payload:       events.UserMessagePayload{Content: "what is running?"},
+	})
+	if err == nil {
+		t.Fatal("an event naming no agent was accepted")
+	}
+	if len(store.persisted) != 0 {
+		t.Errorf("the log was written to anyway: %d events", len(store.persisted))
 	}
 }

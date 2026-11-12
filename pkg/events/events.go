@@ -39,6 +39,7 @@ type EventPayload interface {
 // concrete, typed payload for ev.Typ (e.g. UserMessagePayload)
 type Event struct {
 	SessionID     string      	`json:"session_id"`
+	AgentID       string      	`json:"agent_id"`
 	ID            string      	`json:"id"`
 	Seq           int         	`json:"seq"`
 	Timestamp     time.Time   	`json:"timestamp"`
@@ -52,6 +53,7 @@ type Event struct {
 // can be deferred until Typ is known.
 type eventJSON struct {
 	SessionID     string          `json:"session_id"`
+	AgentID       string          `json:"agent_id"`
 	ID            string          `json:"id"`
 	Seq           int             `json:"seq"`
 	Timestamp     time.Time       `json:"timestamp"`
@@ -71,6 +73,7 @@ func (e *Event) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("decode payload for %s: %w", aux.Typ, err)
 	}
 	e.SessionID = aux.SessionID
+	e.AgentID = aux.AgentID
 	e.ID = aux.ID
 	e.Seq = aux.Seq
 	e.Timestamp = aux.Timestamp

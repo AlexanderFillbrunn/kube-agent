@@ -77,11 +77,11 @@ func runningTaskStore(t *testing.T) *logStore {
 	actor := users.Actor{UserID: "alice", TenantID: "acme"}
 	store := &logStore{}
 	for _, ev := range []*events.Event{
-		{SessionID: testSessionID, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
+		{SessionID: testSessionID, AgentID: testAgentID, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
 			Payload: events.UserMessagePayload{Content: "audit the cluster", Actor: actor}},
-		{SessionID: testSessionID, ID: "msg-1", Typ: events.AssistantMessageEventType, CorrelationID: &arc,
+		{SessionID: testSessionID, AgentID: testAgentID, ID: "msg-1", Typ: events.AssistantMessageEventType, CorrelationID: &arc,
 			Payload: events.AssistantMessagePayload{ModelID: "gpt-5", Content: "starting the audit"}},
-		{SessionID: testSessionID, ID: "task-1", Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc,
+		{SessionID: testSessionID, AgentID: testAgentID, ID: "task-1", Typ: events.AsyncTaskInvokeEventType, CorrelationID: &arc,
 			Payload: events.AsyncTaskInvokePayload{TaskName: "auditor"}},
 	} {
 		if _, err := store.Persist(context.Background(), ev); err != nil {
@@ -100,7 +100,7 @@ func reportsFor(t *testing.T, store *logStore, replies ...*LLMResponse) *TaskRep
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
-	worker, err := NewArcWorker(store, store, agent, nil)
+	worker, err := NewArcWorker(store, store, NewFixedResolver(agent), nil)
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
@@ -111,7 +111,9 @@ func reportsFor(t *testing.T, store *logStore, replies ...*LLMResponse) *TaskRep
 	return reports
 }
 
-func taskRef() TaskRef { return TaskRef{ArcRef: testRef(), ID: "task-1", Name: "auditor"} }
+func taskRef() TaskRef {
+	return TaskRef{ArcRef: testRef(), ID: "task-1", Name: "auditor", AgentID: testAgentID}
+}
 
 // A completion is recorded and the arc worked, so the model says what came of
 // the work it started.
@@ -218,7 +220,7 @@ func TestAReportNamingTheWrongArcIsRefused(t *testing.T) {
 	store := runningTaskStore(t)
 	reports := reportsFor(t, store)
 
-	_, err := reports.Report(context.Background(), TaskRef{ArcRef: testRef(), ID: "not-this-one"}, TaskReport{
+	_, err := reports.Report(context.Background(), TaskRef{ArcRef: testRef(), ID: "not-this-one", AgentID: testAgentID}, TaskReport{
 		Kind: TaskReportCompleted, Result: "done", Outcome: events.AsyncTaskOutcomeSuccess})
 	if err == nil {
 		t.Fatal("a report about a task the arc does not hold was accepted")
@@ -248,7 +250,7 @@ func TestAReportOnAHeldArcIsRecordedAndLeft(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
-	worker, err := NewArcWorker(store, store, agent, lease)
+	worker, err := NewArcWorker(store, store, NewFixedResolver(agent), lease)
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
@@ -331,12 +333,12 @@ func TestAWorkerReportsALeaseItCouldNotReach(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
-	worker, err := NewArcWorker(store, store, agent, refusingLease{err: errors.New("no route to the lock service")})
+	worker, err := NewArcWorker(store, store, NewFixedResolver(agent), refusingLease{err: errors.New("no route to the lock service")})
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
 
-	worked, err := worker.Work(context.Background(), testRef())
+	worked, err := worker.Work(context.Background(), testRef(), testAgentID)
 	if err == nil {
 		t.Fatal("an unreachable lease was reported as an arc somebody else held")
 	}
@@ -353,12 +355,12 @@ func TestAWorkerRefusesAnArcFromAnotherSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
-	worker, err := NewArcWorker(store, store, agent, nil)
+	worker, err := NewArcWorker(store, store, NewFixedResolver(agent), nil)
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}
 
-	if _, err := worker.Work(context.Background(), ArcRef{SessionID: "somebody-else", ArcID: testArcID}); err == nil {
+	if _, err := worker.Work(context.Background(), ArcRef{SessionID: "somebody-else", ArcID: testArcID}, testAgentID); err == nil {
 		t.Error("an arc was worked under a session it is not in")
 	}
 }
@@ -425,4 +427,19 @@ func valuesOf(stored []*events.Event) []events.Event {
 		out = append(out, *ev)
 	}
 	return out
+}
+
+// A ref that names no agent has nobody to hand the arc to, and the report is
+// refused rather than worked by a guess: the ref is the address a task carries
+// for its whole life, so one that never said who started it is broken.
+func TestAReportUnderARefNamingNoAgentIsRefused(t *testing.T) {
+	store := runningTaskStore(t)
+	reports := reportsFor(t, store)
+
+	ref := TaskRef{ArcRef: testRef(), ID: "task-1", Name: "auditor"}
+	if _, err := reports.Report(context.Background(), ref, TaskReport{
+		Kind: TaskReportNotification, Message: "half through",
+	}); err == nil {
+		t.Error("a report under a ref naming no agent was accepted")
+	}
 }

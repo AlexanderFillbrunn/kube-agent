@@ -17,8 +17,8 @@ import (
 func modelOver(t *testing.T, store *filestore.Store) model {
 	t.Helper()
 	s := &session{id: "session", store: store, actor: users.Actor{UserID: "dev"}}
-	llm := agent.NewOpenAI("test-key", "gpt-5")
-	return newModel(s, &sender{}, llm, newTranscript(), nil).resize(80, 24)
+	settings := agent.AgentSettings{Model: agent.ModelRef{Source: "openai", Name: "gpt-5"}}
+	return newModel(s, &sender{}, settings, filepath.Join(t.TempDir(), "agents.json"), newTranscript(), nil).resize(80, 24)
 }
 
 // Clearing has to reach the log, or the next turn replays a conversation the
@@ -152,8 +152,8 @@ func TestModelSwitches(t *testing.T) {
 	if command != nil {
 		t.Error("switching a model did something else as well")
 	}
-	if switched.llm.Model != "gpt-4.1" {
-		t.Errorf("client asks for %q, want gpt-4.1", switched.llm.Model)
+	if switched.settings.Model.Name != "gpt-4.1" {
+		t.Errorf("client asks for %q, want gpt-4.1", switched.settings.Model.Name)
 	}
 	if note := switched.transcript.blocks[0]; note.kind != blockNote || !strings.Contains(note.text, "gpt-5") {
 		t.Errorf("note = %+v, want it to say what was switched from", note)
@@ -173,8 +173,8 @@ func TestModelWithNoNameReports(t *testing.T) {
 	defer store.Close()
 
 	reported, _ := runCommand(modelOver(t, store), "/model")
-	if reported.llm.Model != "gpt-5" {
-		t.Errorf("client asks for %q, want it unchanged", reported.llm.Model)
+	if reported.settings.Model.Name != "gpt-5" {
+		t.Errorf("client asks for %q, want it unchanged", reported.settings.Model.Name)
 	}
 	if note := reported.transcript.blocks[0]; !strings.Contains(note.text, "gpt-5") {
 		t.Errorf("note = %q, want the model it is using", note.text)
