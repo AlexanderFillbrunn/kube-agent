@@ -53,6 +53,7 @@ func (s *session) ref(arcID string) agent.ArcRef {
 func (s *session) turn(ctx context.Context, arcID, message string) error {
 	opening := &events.Event{
 		SessionID:     s.id,
+		AgentID:       localAgentID,
 		Typ:           events.UserMessageEventType,
 		CorrelationID: &arcID,
 		Actor:         s.actor,
@@ -62,7 +63,7 @@ func (s *session) turn(ctx context.Context, arcID, message string) error {
 		return err
 	}
 
-	worked, err := s.worker.Work(ctx, s.ref(arcID))
+	worked, err := s.worker.Work(ctx, s.ref(arcID), localAgentID)
 	if err != nil {
 		return err
 	}
@@ -94,6 +95,7 @@ func (s *session) cancel(ctx context.Context, arcID, reason string) error {
 	}
 	if _, err := s.persistor.Persist(ctx, &events.Event{
 		SessionID:     s.id,
+		AgentID:       localAgentID,
 		Typ:           events.CancelEventType,
 		CorrelationID: &arcID,
 		Actor:         s.actor,

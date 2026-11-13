@@ -84,7 +84,7 @@ func TestTurnWritesAWholeArc(t *testing.T) {
 	}
 
 	persistor := agent.PublishEvents(agent.MintIdentity(store), captureEvents{shown: shown})
-	worker, err := agent.NewArcWorker(persistor, store, chat, nil,
+	worker, err := agent.NewArcWorker(persistor, store, agent.NewFixedResolver(chat), nil,
 		agent.WithTokenSink(captureTokens{text: &tokens}))
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
@@ -207,7 +207,7 @@ func TestSecondTurnReplaysTheFirst(t *testing.T) {
 	}
 
 	persistor := agent.MintIdentity(store)
-	worker, err := agent.NewArcWorker(persistor, store, chat, nil)
+	worker, err := agent.NewArcWorker(persistor, store, agent.NewFixedResolver(chat), nil)
 	if err != nil {
 		t.Fatalf("NewArcWorker: %v", err)
 	}

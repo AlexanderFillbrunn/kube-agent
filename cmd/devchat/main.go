@@ -16,9 +16,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -32,24 +34,31 @@ import (
 // not belong next to the source.
 const defaultStore = ".devchat/session.jsonl"
 
+// defaultSettings is the agent settings file the resolver reads. It is a
+// working file of a development tool, so it lives with the sessions.
+const defaultSettings = ".devchat/agents.json"
+
+// localAgentID names the one agent this harness runs. The resolver ignores
+// it, but every work item and every event carries it, so the plumbing is
+// exercised exactly as a deployed tier would exercise it.
+const localAgentID = "local"
+
 const defaultSystemPrompt = `You are a Kubernetes operations assistant with read and restart tools.
 Use them rather than guessing, and say plainly when a tool tells you something you did not expect.`
 
 func main() {
 	store := flag.String("store", defaultStore, "event log to append to, resuming it if it exists")
-	model := flag.String("model", "gpt-5", "model to ask")
-	baseURL := flag.String("base-url", "", "an OpenAI-compatible endpoint to use instead of OpenAI's")
-	system := flag.String("system", defaultSystemPrompt, "system prompt")
+	settings := flag.String("settings", defaultSettings, "agent settings the resolver reads, created if absent")
 	user := flag.String("user", "dev", "who the messages are from")
 	flag.Parse()
 
-	if err := run(*store, *model, *baseURL, *system, *user); err != nil {
+	if err := run(*store, *settings, *user); err != nil {
 		fmt.Fprintf(os.Stderr, "devchat: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(storePath, modelName, baseURL, systemPrompt, userID string) error {
+func run(storePath, settingsPath, userID string) error {
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	if apiKey == "" {
 		return fmt.Errorf("OPENAI_API_KEY is not set")
@@ -72,25 +81,42 @@ func run(storePath, modelName, baseURL, systemPrompt, userID string) error {
 		return err
 	}
 
-	opts := []agent.OpenAIOption{}
-	if baseURL != "" {
-		opts = append(opts, agent.WithBaseURL(baseURL))
+	// The model sources hold what the settings file cannot: which endpoints
+	// exist and how to reach them. "openai" is the vendor's own, and "local"
+	// is any OpenAI-compatible endpoint this process is pointed at, so a
+	// definition asks a source and never says where the source lives.
+	openai := func(ref agent.ModelRef) (agent.LLM, error) {
+		return agent.NewOpenAI(apiKey, ref.Name), nil
 	}
-	llm := agent.NewOpenAI(apiKey, modelName, opts...)
+	modelSources := map[string]agent.ModelFactory{"openai": openai}
+	if baseURL := os.Getenv("OPENAI_BASE_URL"); baseURL != "" {
+		modelSources["local"] = func(ref agent.ModelRef) (agent.LLM, error) {
+			return agent.NewOpenAI(apiKey, ref.Name, agent.WithBaseURL(baseURL)), nil
+		}
+	}
+
+	// The settings file is what the resolver reads, so the prompt, the model
+	// and the tools are edited between arcs rather than passed once at
+	// startup. A missing file is the first run, and it gets the defaults.
+	if _, err := os.Stat(settingsPath); os.IsNotExist(err) {
+		if err := writeDefaultSettings(settingsPath); err != nil {
+			return err
+		}
+	}
+	settings, err := readSettings(settingsPath)
+	if err != nil {
+		return err
+	}
+
+	// "local" is the one tool source this harness holds: the fake tools
+	// compiled into it. A settings file may name no other.
+	sources := map[string]agent.ToolProvider{"local": registry}
+	resolver := agent.NewFileResolver(settingsPath, sources, modelSources, agent.WithTasks(tasks, runner))
 
 	// The sinks report into the interface, and the interface cannot exist
 	// until the model is built, so they go through a sender that is pointed at
 	// the program once there is one.
 	relay := &sender{}
-	chat, err := agent.NewAgent(
-		&agent.AgentConfig{SystemPrompt: systemPrompt},
-		registry,
-		llm,
-		agent.WithTasks(tasks, runner),
-	)
-	if err != nil {
-		return err
-	}
 
 	// Notification hangs off the persistor rather than the agent, so
 	// everything written reaches the screen: the user's own message and a
@@ -110,7 +136,7 @@ func run(storePath, modelName, baseURL, systemPrompt, userID string) error {
 	// run's own CancelFunc, but then the harness would exercise a path nothing
 	// else has.
 	cancels := agent.NewLocalCancels()
-	worker, err := agent.NewArcWorker(persistor, store, chat, agent.NewLocalLease(),
+	worker, err := agent.NewArcWorker(persistor, store, resolver, agent.NewLocalLease(),
 		agent.WithTokenSink(screenTokens{relay: relay}),
 		agent.WithCancelWatcher(cancels))
 	if err != nil {
@@ -148,7 +174,7 @@ func run(storePath, modelName, baseURL, systemPrompt, userID string) error {
 	// The only runner here is this process, so a task in that log is one an
 	// earlier process died on. Left alone it would hold its arc open for
 	// ever.
-	settled, err := agent.SettleAbandonedTasks(context.Background(), persistor, recorded)
+	settled, err := agent.SettleAbandonedTasks(context.Background(), agent.AsAgent(localAgentID, persistor), recorded)
 	if err != nil {
 		return err
 	}
@@ -161,9 +187,55 @@ func run(storePath, modelName, baseURL, systemPrompt, userID string) error {
 	existing := newTranscript()
 	existing.fromHistory(recorded)
 
-	program := tea.NewProgram(newModel(session, relay, llm, existing, worker))
+	program := tea.NewProgram(newModel(session, relay, settings, settingsPath, existing, worker))
 	relay.attach(program)
 
 	_, err = program.Run()
 	return err
+}
+
+// writeDefaultSettings leaves a settings file for the resolver to read, so a
+// first run has an agent and the prompt, the model and the tools are there to
+// be edited. The tools are the fake ones this harness registers, since a
+// definition can only pick what its process holds.
+func writeDefaultSettings(path string) error {
+	settings := agent.AgentSettings{
+		SystemPrompt: defaultSystemPrompt,
+		Model:        agent.ModelRef{Source: "openai", Name: "gpt-5"},
+		Tools: []agent.ToolRef{
+			{Source: "local", Name: "list_pods"},
+			{Source: "local", Name: "wait"},
+			{Source: "local", Name: "restart_deployment"},
+		},
+	}
+	return writeSettings(path, settings)
+}
+
+// readSettings parses the settings file, for the interface as much as the
+// resolver: the header shows the model the definition names, not one the
+// process holds a pointer to.
+func readSettings(path string) (agent.AgentSettings, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return agent.AgentSettings{}, err
+	}
+	var settings agent.AgentSettings
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		return agent.AgentSettings{}, fmt.Errorf("parse agent settings %s: %w", path, err)
+	}
+	return settings, nil
+}
+
+// writeSettings puts the settings back, which is how /model changes the model:
+// the file is the definition, the resolver rereads it on the next arc, and one
+// run never changes the model another arc is already asking.
+func writeSettings(path string, settings agent.AgentSettings) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	raw, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, raw, 0o644)
 }

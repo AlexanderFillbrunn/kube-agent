@@ -89,9 +89,11 @@ type model struct {
 	input    textarea.Model
 	spinner  spinner.Model
 
-	// llm is held so that /model can point the session at another one. It is
-	// only ever changed between turns.
-	llm *agent.OpenAI
+	// settings is the definition the resolver reads, held so the header shows
+	// the model it names and /model can rewrite it. It is only ever changed
+	// between turns, and the resolver rereads the file on the next arc.
+	settings     agent.AgentSettings
+	settingsPath string
 
 	// cancel stops the run in progress, and is nil when nothing is running.
 	cancel context.CancelFunc
@@ -114,7 +116,7 @@ type model struct {
 	ready  bool
 }
 
-func newModel(s *session, sender *sender, llm *agent.OpenAI, existing *transcript, worker *agent.ArcWorker) model {
+func newModel(s *session, sender *sender, settings agent.AgentSettings, settingsPath string, existing *transcript, worker *agent.ArcWorker) model {
 	input := textarea.New()
 	input.Placeholder = "Ask about the cluster…"
 	input.ShowLineNumbers = false
@@ -125,13 +127,14 @@ func newModel(s *session, sender *sender, llm *agent.OpenAI, existing *transcrip
 	spin := spinner.New(spinner.WithSpinner(spinner.MiniDot), spinner.WithStyle(busyStyle))
 
 	return model{
-		session:    s,
-		transcript: existing,
-		sender:     sender,
-		input:      input,
-		spinner:    spin,
-		llm:        llm,
-		worker:     worker,
+		session:      s,
+		transcript:   existing,
+		sender:       sender,
+		input:        input,
+		spinner:      spin,
+		settings:     settings,
+		settingsPath: settingsPath,
+		worker:       worker,
 	}
 }
 
@@ -286,7 +289,7 @@ func (m model) settleOwed() (tea.Model, tea.Cmd) {
 	worker, sender, session := m.worker, m.sender, m.session
 	go func() {
 		defer cancel()
-		worked, err := worker.Work(ctx, session.ref(arc))
+		worked, err := worker.Work(ctx, session.ref(arc), localAgentID)
 		if err == nil && !worked {
 			// Still held by somebody. The turn is still owed.
 			sender.send(taskOwedMsg{arcID: arc})
@@ -370,5 +373,5 @@ func (m model) headerView(width int) string {
 	if m.transcript != nil {
 		running = m.transcript.runningTasks()
 	}
-	return renderHeader(m.llm.Model, running, width)
+	return renderHeader(m.settings.Model.Name, running, width)
 }

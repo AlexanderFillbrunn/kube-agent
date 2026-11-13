@@ -31,7 +31,7 @@ type StreamToken struct {
 	MessageID string
 
 	Content string
-	Seq int
+	Seq     int
 }
 
 // TokenSink takes a reply as it is written.
@@ -57,7 +57,7 @@ type TokenSink interface {
 type ArcWorker struct {
 	persistor EventPersistor
 	source    EventSource
-	agent     *Agent
+	resolver  AgentResolver
 	lease     ArcLease
 
 	// tokens follows a reply as it is written, and is nil for a worker nobody
@@ -86,14 +86,14 @@ func WithCancelWatcher(cancels CancelWatcher) ArcWorkerOption {
 
 // NewArcWorker builds a worker from the parts a run is made of. A nil lease
 // becomes a LocalLease.
-func NewArcWorker(persistor EventPersistor, source EventSource, agent *Agent, lease ArcLease, options ...ArcWorkerOption) (*ArcWorker, error) {
-	if persistor == nil || source == nil || agent == nil {
-		return nil, errors.New("an arc worker needs a persistor, a source and an agent")
+func NewArcWorker(persistor EventPersistor, source EventSource, resolver AgentResolver, lease ArcLease, options ...ArcWorkerOption) (*ArcWorker, error) {
+	if persistor == nil || source == nil || resolver == nil {
+		return nil, errors.New("an arc worker needs a persistor, a source and a resolver")
 	}
 	if lease == nil {
 		lease = NewLocalLease()
 	}
-	worker := &ArcWorker{persistor: persistor, source: source, agent: agent, lease: lease}
+	worker := &ArcWorker{persistor: persistor, source: source, resolver: resolver, lease: lease}
 	for _, option := range options {
 		option(worker)
 	}
@@ -103,7 +103,15 @@ func NewArcWorker(persistor EventPersistor, source EventSource, agent *Agent, le
 // Work replays an arc from the log and runs the agent over it. It returns
 // false without running when another caller holds the arc, which leaves that
 // arc owed a run.
-func (w *ArcWorker) Work(ctx context.Context, ref ArcRef) (bool, error) {
+//
+// The work item names the agent that works the arc, and there is no default:
+// a caller that cannot name one has nothing to hand the worker. The agent is
+// resolved once the arc is held, so a resolver that cannot build it fails a
+// worker that owns the arc rather than one queued behind somebody else.
+func (w *ArcWorker) Work(ctx context.Context, ref ArcRef, agentID string) (bool, error) {
+	if agentID == "" {
+		return false, errors.New("a work item names no agent")
+	}
 	release, ok, err := w.lease.Acquire(ctx, ref)
 	if err != nil {
 		return false, fmt.Errorf("could not take the lease on arc %s: %w", ref, err)
@@ -116,12 +124,18 @@ func (w *ArcWorker) Work(ctx context.Context, ref ArcRef) (bool, error) {
 	ctx, stop := w.watchForCancel(ctx, ref)
 	defer stop()
 
+	agent, err := w.resolver.ResolveAgent(ctx, agentID)
+	if err != nil {
+		return false, fmt.Errorf("resolve agent %s for arc %s: %w", agentID, ref, err)
+	}
+
 	h, err := w.arcHistory(ctx, ref)
 	if err != nil {
 		return false, err
 	}
-	return true, w.agent.Run(ctx, RunOptions{
-		Persistor: w.persistor,
+	return true, agent.Run(ctx, RunOptions{
+		Persistor: AsAgent(agentID, w.persistor),
+		AgentID:   agentID,
 		History:   h,
 		ArcID:     ref.ArcID,
 		Tokens:    w.tokenSink(ctx, ref),
@@ -175,7 +189,7 @@ func (w *ArcWorker) tokenSink(ctx context.Context, ref ArcRef) Sink[Token] {
 			ArcID:     ref.ArcID,
 			MessageID: tok.MessageID,
 			Content:   tok.Content,
-			Seq: 	   tok.Seq,
+			Seq:       tok.Seq,
 		})
 		return nil
 	})

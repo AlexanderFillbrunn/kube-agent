@@ -38,13 +38,14 @@ func runningModel(t *testing.T, arc string) (model, context.Context, *filestore.
 	// The arc has to be opened before it can be withdrawn: a cancel naming an
 	// arc the fold never saw is an error, not a cancel.
 	if _, err := s.persistor.Persist(context.Background(), &events.Event{
-		SessionID: s.id, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
+		SessionID: s.id, AgentID: localAgentID, Typ: events.UserMessageEventType, CorrelationID: &arc, Actor: actor,
 		Payload: events.UserMessagePayload{Content: "what is pending?", Actor: actor},
 	}); err != nil {
 		t.Fatalf("Persist: %v", err)
 	}
 
-	m := newModel(s, &sender{}, agent.NewOpenAI("test-key", "gpt-5"), newTranscript(), nil).resize(80, 24)
+	settings := agent.AgentSettings{Model: agent.ModelRef{Source: "openai", Name: "gpt-5"}}
+	m := newModel(s, &sender{}, settings, "", newTranscript(), nil).resize(80, 24)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	m.cancel = cancel
@@ -164,12 +165,12 @@ func TestCancelCanBeSentWhileTheAgentIsWorking(t *testing.T) {
 func TestOtherCommandsStillWaitForTheTurnToEnd(t *testing.T) {
 	m, _, _ := runningModel(t, "arc-1")
 	m.input.SetValue("/model gpt-4")
-	was := m.llm.Model
+	was := m.settings.Model.Name
 
 	m, _ = pressEnter(m)
 
-	if m.llm.Model != was {
-		t.Errorf("the model switched to %s mid-run, want it left at %s", m.llm.Model, was)
+	if m.settings.Model.Name != was {
+		t.Errorf("the model switched to %s mid-run, want it left at %s", m.settings.Model.Name, was)
 	}
 	if got := m.input.Value(); got != "/model gpt-4" {
 		t.Errorf("the input holds %q, want the command kept for later", got)

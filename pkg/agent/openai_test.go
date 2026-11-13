@@ -25,6 +25,10 @@ const (
 // stores, locks or routes by arc is addressed.
 func testRef() ArcRef { return ArcRef{SessionID: testSessionID, ArcID: testArcID} }
 
+// testAgentID names the agent the fixtures run under, the way a work item
+// would name it.
+const testAgentID = "test-agent"
+
 // newTestServer serves one canned response and captures the request that asked
 // for it.
 func newTestServer(t *testing.T, body string, captured *openAIRequest) *httptest.Server {

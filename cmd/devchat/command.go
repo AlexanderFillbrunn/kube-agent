@@ -123,22 +123,30 @@ func cancelTurn(m model, reason string) (model, tea.Cmd) {
 // switchModel points the rest of the session at another model, and with no
 // name says which one is being used.
 //
-// Nothing is checked, since whether an endpoint serves a name is only answered
-// by asking it. A wrong name shows up as a failed turn. The conversation
-// carries over, and every reply records the model that produced it.
+// It rewrites the settings file rather than any client, since the file is the
+// definition the resolver reads: the change lands on the next arc, and a run
+// already asking the old model is left to finish on it. Nothing is checked,
+// since whether an endpoint serves a name is only answered by asking it. A
+// wrong name shows up as a failed turn. The conversation carries over, and
+// every reply records the model that produced it.
 func switchModel(m model, name string) (model, tea.Cmd) {
 	if name == "" {
-		m.transcript.note("using " + m.llm.Model)
+		m.transcript.note("using " + m.settings.Model.Name)
 		return m.refresh(), nil
 	}
-	if name == m.llm.Model {
+	if name == m.settings.Model.Name {
 		m.transcript.note("already using " + name)
 		return m.refresh(), nil
 	}
 
-	was := m.llm.Model
-	m.llm.Model = name
-	m.transcript.note(fmt.Sprintf("switched from %s to %s", was, name))
+	was := m.settings.Model.Name
+	m.settings.Model.Name = name
+	if err := writeSettings(m.settingsPath, m.settings); err != nil {
+		m.settings.Model.Name = was
+		m.transcript.note(fmt.Sprintf("could not switch: %v", err))
+		return m.refresh(), nil
+	}
+	m.transcript.note(fmt.Sprintf("switched from %s to %s, from the next turn", was, name))
 	return m.refresh(), nil
 }
 
