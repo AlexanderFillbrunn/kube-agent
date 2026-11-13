@@ -42,7 +42,7 @@ func TestARunWithNoTokenSinkRecordsTheSameLog(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewAgent: %v", err)
 		}
-		if err := agent.Run(context.Background(), RunOptions{AgentID: testAgentID, 
+		if err := agent.Run(context.Background(), RunOptions{
 			Persistor: store, History: userArcHistory(t), ArcID: testArcID, Tokens: tokens,
 		}); err != nil {
 			t.Fatalf("Run: %v", err)
@@ -70,7 +70,7 @@ func TestStreamedTokensNameTheMessageThatRecordsThem(t *testing.T) {
 	}
 
 	var streamed []Token
-	if err := agent.Run(context.Background(), RunOptions{AgentID: testAgentID, 
+	if err := agent.Run(context.Background(), RunOptions{
 		Persistor: store,
 		History:   userArcHistory(t),
 		ArcID:     testArcID,
@@ -122,7 +122,7 @@ func TestAFailingTokenSinkDoesNotFailTheRun(t *testing.T) {
 	}
 
 	h := userArcHistory(t)
-	if err := agent.Run(context.Background(), RunOptions{AgentID: testAgentID, 
+	if err := agent.Run(context.Background(), RunOptions{
 		Persistor: store, History: h, ArcID: testArcID,
 		Tokens: SinkFromFunc(func(Token) error { return errors.New("the watcher is gone") }),
 	}); err != nil {

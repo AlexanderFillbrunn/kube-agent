@@ -61,7 +61,7 @@ func runGuarded(t *testing.T, cancels *cancelledArcs) (*history.History, *fakePe
 	}
 
 	h := userArcHistory(t)
-	runErr := agent.Run(context.Background(), RunOptions{AgentID: testAgentID, Persistor: guarded, History: h, ArcID: testArcID})
+	runErr := agent.Run(context.Background(), RunOptions{Persistor: guarded, History: h, ArcID: testArcID})
 	if ran && cancels.arcs[testArcID] != nil {
 		t.Error("the tool ran for a cancelled arc")
 	}

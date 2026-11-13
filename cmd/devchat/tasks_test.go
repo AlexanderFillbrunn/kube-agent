@@ -80,7 +80,7 @@ func newHarness(t *testing.T, replies ...*agent.LLMResponse) *harness {
 	if err != nil {
 		t.Fatalf("NewTaskReports: %v", err)
 	}
-	runner.attach(reports, nil, nil)
+	runner.attach(reports, localAgentID, nil, nil)
 
 	return &harness{
 		store:   store,

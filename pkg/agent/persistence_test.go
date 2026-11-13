@@ -199,7 +199,7 @@ func TestARunPublishesEverythingItWrites(t *testing.T) {
 	}
 
 	h := userArcHistory(t)
-	if err := agent.Run(context.Background(), RunOptions{AgentID: testAgentID, 
+	if err := agent.Run(context.Background(), RunOptions{
 		Persistor: PublishEvents(store, sink),
 		History:   h,
 		ArcID:     testArcID,

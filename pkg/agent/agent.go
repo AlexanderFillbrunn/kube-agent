@@ -110,12 +110,6 @@ type RunOptions struct {
 	// Persistor is where the run writes.
 	Persistor EventPersistor
 
-	// AgentID names the agent this run runs under. The run stamps nothing
-	// with it — that is the persistor's wrapper's job — but the tasks it
-	// starts carry it in their refs, so a report hands the arc back to the
-	// agent that started it.
-	AgentID string
-
 	// History is the arc's log, already folded. The session it names is what
 	// the run's own events are filed under.
 	History *history.History
@@ -136,7 +130,6 @@ type agentState struct {
 	foldState *history.FoldState
 	persistor EventPersistor
 	tokens    Sink[Token]
-	agentID   string
 }
 
 // ref names the arc the run is working, for anything that has to address it
@@ -157,9 +150,6 @@ func (a Agent) Run(ctx context.Context, run RunOptions) error {
 	if run.History.SessionID == "" {
 		return errors.New("a run needs a history that names its session")
 	}
-	if run.AgentID == "" {
-		return errors.New("a run needs the agent it runs under")
-	}
 
 	var arc *history.Arc
 	for _, candidate := range slices.Backward(run.History.Arcs) {
@@ -178,7 +168,6 @@ func (a Agent) Run(ctx context.Context, run RunOptions) error {
 		foldState: history.FoldStateFromHistory(run.History),
 		persistor: run.Persistor,
 		tokens:    run.Tokens,
-		agentID:   run.AgentID,
 	}
 
 	// A cancelled arc has no agent work left, but the tasks it started might
@@ -217,7 +206,7 @@ func (a Agent) stopArcTasks(ctx context.Context, state *agentState) error {
 		if task.FinishedSeq != nil {
 			continue
 		}
-		ref := TaskRef{ArcRef: state.ref(), ID: task.ID, Name: task.TaskName, AgentID: state.agentID}
+		ref := TaskRef{ArcRef: state.ref(), ID: task.ID, Name: task.TaskName}
 		if err := a.controller.Cancel(ctx, ref, reason); err != nil {
 			unreached = append(unreached, fmt.Errorf("stop task %s: %w", task.TaskName, err))
 		}
@@ -634,7 +623,7 @@ func (a Agent) startTask(ctx context.Context, call *history.ToolCall, state *age
 		return err
 	}
 
-	ref := TaskRef{ArcRef: state.ref(), ID: invocationID, Name: call.ToolName, AgentID: state.agentID}
+	ref := TaskRef{ArcRef: state.ref(), ID: invocationID, Name: call.ToolName}
 	if err := definition.Start(ctx, ref, call.Args); err != nil {
 		return a.settleUnstartedTask(ctx, call, ref, err, state)
 	}
@@ -688,10 +677,9 @@ func (a Agent) cancelTask(ctx context.Context, call *history.ToolCall, state *ag
 
 	reason, _ := stringArg(call.Args, "reason")
 	ref := TaskRef{
-		ArcRef:  ArcRef{SessionID: state.history.SessionID, ArcID: task.CorrelationID},
-		ID:      task.ID,
-		Name:    task.TaskName,
-		AgentID: state.agentID,
+		ArcRef: ArcRef{SessionID: state.history.SessionID, ArcID: task.CorrelationID},
+		ID:     task.ID,
+		Name:   task.TaskName,
 	}
 	if err := a.controller.Cancel(ctx, ref, reason); err != nil {
 		return a.settleCall(ctx, call, ToolOutcome{Result: fmt.Sprintf(
@@ -744,7 +732,6 @@ func (a Agent) provideTaskInput(ctx context.Context, call *history.ToolCall, sta
 		ArcID:     task.CorrelationID,
 		ID:        task.ID,
 		Name:      task.TaskName,
-		AgentID:   state.agentID,
 	}
 	// A task somebody else answered first refuses this answer, and a task that
 	// cannot be reached at all fails the same way. Nothing here tells the two

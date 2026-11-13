@@ -65,12 +65,18 @@ func NewTaskReports(worker *ArcWorker) (*TaskReports, error) {
 // false when somebody else held the arc: the report is in the log, and the
 // caller is the one that knows when to come back for the turn.
 //
+// The report is one work item, and agentID names the agent that works the arc
+// it hands over, by the same rule as ArcWorker.Work: a caller that cannot name
+// one has nothing to hand the worker. Whoever hands a report over learns the
+// agent the way the harness that owns the session does; nothing here derives
+// it, since the framework has no way to know who works a session.
+//
 // The arc is worked whatever the report was, since whether there is anything
 // to do is decided by reading the log. A report naming an arc that does not
 // own the task is refused.
-func (r *TaskReports) Report(ctx context.Context, ref TaskRef, report TaskReport) (bool, error) {
-	if ref.AgentID == "" {
-		return false, fmt.Errorf("task %s reports under a ref naming no agent to work arc %s", ref.ID, ref.ArcID)
+func (r *TaskReports) Report(ctx context.Context, ref TaskRef, agentID string, report TaskReport) (bool, error) {
+	if agentID == "" {
+		return false, fmt.Errorf("a report on task %s names no agent to work arc %s", ref.ID, ref.ArcID)
 	}
 	h, err := r.worker.arcHistory(ctx, ref.ArcRef)
 	if err != nil {
@@ -84,11 +90,11 @@ func (r *TaskReports) Report(ctx context.Context, ref TaskRef, report TaskReport
 	if err != nil {
 		return false, err
 	}
-	if _, err := AsAgent(ref.AgentID, r.worker.persistor).Persist(ctx, ev); err != nil {
+	if _, err := AsAgent(agentID, r.worker.persistor).Persist(ctx, ev); err != nil {
 		return false, err
 	}
 
-	return r.worker.Work(ctx, ref.ArcRef, ref.AgentID)
+	return r.worker.Work(ctx, ref.ArcRef, agentID)
 }
 
 // holdsTask reports whether the arc named really owns the task named.

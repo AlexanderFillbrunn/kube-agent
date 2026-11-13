@@ -34,12 +34,6 @@ type TaskRef struct {
 
 	// Name is the kind of task, as the registry knows it.
 	Name string
-
-	// AgentID names the agent that started the task, which is the agent that
-	// works the arc when the task reports. The ref is the address a task
-	// carries for its whole life, so it says who to hand the arc back to and
-	// nothing has to recover that from anywhere else.
-	AgentID string
 }
 
 // Starter launches one kind of task and returns as soon as the work is under

@@ -112,7 +112,7 @@ func reportsFor(t *testing.T, store *logStore, replies ...*LLMResponse) *TaskRep
 }
 
 func taskRef() TaskRef {
-	return TaskRef{ArcRef: testRef(), ID: "task-1", Name: "auditor", AgentID: testAgentID}
+	return TaskRef{ArcRef: testRef(), ID: "task-1", Name: "auditor"}
 }
 
 // A completion is recorded and the arc worked, so the model says what came of
@@ -121,7 +121,7 @@ func TestACompletionIsRecordedAndGetsTheModelATurn(t *testing.T) {
 	store := runningTaskStore(t)
 	reports := reportsFor(t, store, &LLMResponse{ModelID: "gpt-5", Content: "the audit found 3 things"})
 
-	worked, err := reports.Report(context.Background(), taskRef(), TaskReport{
+	worked, err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
 		Kind: TaskReportCompleted, Result: "3 findings", Outcome: events.AsyncTaskOutcomeSuccess})
 	if err != nil {
 		t.Fatalf("Report: %v", err)
@@ -142,7 +142,7 @@ func TestAnInputRequestGetsTheModelATurn(t *testing.T) {
 	store := runningTaskStore(t)
 	reports := reportsFor(t, store, &LLMResponse{ModelID: "gpt-5", Content: "which namespace should I audit?"})
 
-	_, err := reports.Report(context.Background(), taskRef(), TaskReport{
+	_, err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
 		Kind: TaskReportInputRequested, RequestID: "ask-1", Message: "which namespace?"})
 	if err != nil {
 		t.Fatalf("Report: %v", err)
@@ -160,7 +160,7 @@ func TestAnInputRequestIsWrittenUnderTheNameTheTaskGaveIt(t *testing.T) {
 	store := runningTaskStore(t)
 	reports := reportsFor(t, store, &LLMResponse{ModelID: "gpt-5", Content: "which namespace should I audit?"})
 
-	if _, err := reports.Report(context.Background(), taskRef(), TaskReport{
+	if _, err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
 		Kind: TaskReportInputRequested, RequestID: "ask-1", Message: "which namespace?"}); err != nil {
 		t.Fatalf("Report: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestAnInputRequestWithoutARequestIDIsRefused(t *testing.T) {
 	store := runningTaskStore(t)
 	reports := reportsFor(t, store)
 
-	if _, err := reports.Report(context.Background(), taskRef(), TaskReport{
+	if _, err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
 		Kind: TaskReportInputRequested, Message: "which namespace?"}); err == nil {
 		t.Fatal("an unnamed request was accepted")
 	}
@@ -201,7 +201,7 @@ func TestANotificationIsRecordedAndSaysNothing(t *testing.T) {
 	store := runningTaskStore(t)
 	reports := reportsFor(t, store)
 
-	_, err := reports.Report(context.Background(), taskRef(), TaskReport{
+	_, err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
 		Kind: TaskReportNotification, Message: "scanned 40 namespaces"})
 	if err != nil {
 		t.Fatalf("Report: %v", err)
@@ -220,7 +220,7 @@ func TestAReportNamingTheWrongArcIsRefused(t *testing.T) {
 	store := runningTaskStore(t)
 	reports := reportsFor(t, store)
 
-	_, err := reports.Report(context.Background(), TaskRef{ArcRef: testRef(), ID: "not-this-one", AgentID: testAgentID}, TaskReport{
+	_, err := reports.Report(context.Background(), TaskRef{ArcRef: testRef(), ID: "not-this-one"}, testAgentID, TaskReport{
 		Kind: TaskReportCompleted, Result: "done", Outcome: events.AsyncTaskOutcomeSuccess})
 	if err == nil {
 		t.Fatal("a report about a task the arc does not hold was accepted")
@@ -235,7 +235,7 @@ func TestACompletionWithoutAnOutcomeIsRefused(t *testing.T) {
 	store := runningTaskStore(t)
 	reports := reportsFor(t, store)
 
-	_, err := reports.Report(context.Background(), taskRef(), TaskReport{Kind: TaskReportCompleted, Result: "done"})
+	_, err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{Kind: TaskReportCompleted, Result: "done"})
 	if err == nil {
 		t.Fatal("a completion with no outcome was accepted")
 	}
@@ -267,7 +267,7 @@ func TestAReportOnAHeldArcIsRecordedAndLeft(t *testing.T) {
 
 	// The model is scripted with no replies, so a run here would fail rather
 	// than quietly do the wrong thing.
-	worked, err := reports.Report(context.Background(), taskRef(), TaskReport{
+	worked, err := reports.Report(context.Background(), taskRef(), testAgentID, TaskReport{
 		Kind: TaskReportCompleted, Result: "3 findings", Outcome: events.AsyncTaskOutcomeSuccess})
 	if err != nil {
 		t.Fatalf("Report: %v", err)
@@ -429,17 +429,18 @@ func valuesOf(stored []*events.Event) []events.Event {
 	return out
 }
 
-// A ref that names no agent has nobody to hand the arc to, and the report is
-// refused rather than worked by a guess: the ref is the address a task carries
-// for its whole life, so one that never said who started it is broken.
-func TestAReportUnderARefNamingNoAgentIsRefused(t *testing.T) {
+// A report that names no agent has nobody to hand the arc to, and it is
+// refused rather than worked by a guess: the caller that hands a report over
+// is where the agent is known, so one that cannot name it has nothing to
+// hand the worker.
+func TestAReportNamingNoAgentIsRefused(t *testing.T) {
 	store := runningTaskStore(t)
 	reports := reportsFor(t, store)
 
 	ref := TaskRef{ArcRef: testRef(), ID: "task-1", Name: "auditor"}
-	if _, err := reports.Report(context.Background(), ref, TaskReport{
+	if _, err := reports.Report(context.Background(), ref, "", TaskReport{
 		Kind: TaskReportNotification, Message: "half through",
 	}); err == nil {
-		t.Error("a report under a ref naming no agent was accepted")
+		t.Error("a report naming no agent was accepted")
 	}
 }

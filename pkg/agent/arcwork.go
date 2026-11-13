@@ -135,7 +135,6 @@ func (w *ArcWorker) Work(ctx context.Context, ref ArcRef, agentID string) (bool,
 	}
 	return true, agent.Run(ctx, RunOptions{
 		Persistor: AsAgent(agentID, w.persistor),
-		AgentID:   agentID,
 		History:   h,
 		ArcID:     ref.ArcID,
 		Tokens:    w.tokenSink(ctx, ref),

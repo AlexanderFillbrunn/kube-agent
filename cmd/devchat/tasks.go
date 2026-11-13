@@ -34,6 +34,12 @@ type localTasks struct {
 	// is built from the registry these tasks are registered in.
 	reports *agent.TaskReports
 
+	// agentID names the agent that works the arc a report hands over. Devchat
+	// runs one agent and knows which, so it says so when the reports are
+	// attached rather than leaving the framework to recover it: a tier on a
+	// queue would name the agent on each queue item instead.
+	agentID string
+
 	// unfiled is told about a report that could not be written. Everything a
 	// task says that does reach the log reaches the screen through the event
 	// sink; this is the one case there is nothing in the log to publish.
@@ -61,11 +67,12 @@ func newLocalTasks() *localTasks {
 	return &localTasks{running: map[string]*localTask{}}
 }
 
-// attach gives the tasks somewhere to report to, once there is one.
-func (l *localTasks) attach(reports *agent.TaskReports, unfiled func(agent.TaskRef, error), deferred func(string)) {
+// attach gives the tasks somewhere to report to, once there is one, and names
+// the agent their reports are worked under.
+func (l *localTasks) attach(reports *agent.TaskReports, agentID string, unfiled func(agent.TaskRef, error), deferred func(string)) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.reports, l.unfiled, l.deferred = reports, unfiled, deferred
+	l.reports, l.agentID, l.unfiled, l.deferred = reports, agentID, unfiled, deferred
 }
 
 // register adds the canned tasks to a registry.
@@ -224,14 +231,14 @@ func (l *localTasks) stopped(ref agent.TaskRef) {
 // publish and nobody above a task to hand the failure to.
 func (l *localTasks) report(ref agent.TaskRef, report agent.TaskReport) {
 	l.mu.Lock()
-	reports, unfiled, deferred := l.reports, l.unfiled, l.deferred
+	reports, agentID, unfiled, deferred := l.reports, l.agentID, l.unfiled, l.deferred
 	l.mu.Unlock()
 
 	if reports == nil {
 		return
 	}
 
-	worked, err := reports.Report(context.Background(), ref, report)
+	worked, err := reports.Report(context.Background(), ref, agentID, report)
 	if err != nil {
 		if unfiled != nil {
 			unfiled(ref, err)

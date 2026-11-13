@@ -159,7 +159,7 @@ func run(storePath, settingsPath, userID string) error {
 	if err != nil {
 		return err
 	}
-	runner.attach(reports,
+	runner.attach(reports, localAgentID,
 		func(ref agent.TaskRef, err error) { relay.send(taskUnfiledMsg{ref: ref, err: err}) },
 		func(arcID string) { relay.send(taskOwedMsg{arcID: arcID}) },
 	)
