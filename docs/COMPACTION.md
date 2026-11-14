@@ -10,9 +10,9 @@ those two, and the code follows neither this document nor
 [ASYNC-TASKS.md](ASYNC-TASKS.md).
 
 It works through one plan: a request event, a worker that picks it up, a
-result event carrying the summary, playback from the last result, and a lock
-over the session while it happens. The plan survives, with its two halves
-split apart.
+result event carrying the summary, playback from the last result, and the
+session held while it happens — by a record rather than a lock. The plan
+survives, with its two halves split apart.
 
 Nothing needs locking for the log to stay correct, because compaction only
 ever appends. But a compaction takes tens of seconds, and an arc opened
@@ -111,6 +111,13 @@ lines.
 `ThroughSeq` is the whole contract. It is a watermark over the log, and
 every question below — which compaction wins, what a reader loads, whether
 two workers conflict — is answered by comparing watermarks.
+
+The record's `CausationID` names the `COMPACTION_STARTED` it answers. That is
+the request half of the pair: whoever finds compaction due writes the request
+and yields, a worker picks it up, and the result points back. `Supersedes`
+stays as well — one names the request this result answers, the other the
+result this one was built on top of — and the pair is checkable by a reader
+who does not trust the writer.
 
 Compaction is recursive: the second summary is made from the first summary
 plus what has happened since. `Supersedes` records the chain so a reader can
@@ -489,6 +496,13 @@ for free and a side channel is a state it would have to be told about twice.
         Actor *users.Actor
     }
 
+The watermark in the request is the closed-arc cut from Where the cut goes,
+capped at the request's own sequence number: the cut can name nothing the
+request has not seen. The cap matters only in a session whose arcs interleave,
+where the request and the last closed arc can be far apart, and it is what
+makes the request the compaction's vantage — the cut is a function of the log
+up to and including the request, and of nothing written after it.
+
 What keeps this from being the work item the previous section argues against
 is that it is written as a fact and never as a claim. It says a compaction
 covering this much was begun at this time and was expected to take this long.
@@ -515,6 +529,94 @@ unexpired record does not start a second compaction, which is the same
 exclusion an `ArcLease` would give and one fewer thing to stand up. Two
 workers that start in the same instant write two records and compute two
 summaries; that is waste, bounded by the coverage rule, and not a fault.
+
+Blocking and parallel compaction
+--------------------
+Whether a session holds its arcs while a compaction runs is a mode, chosen by
+the session's configuration. Both modes share the whole design above — one
+record, one result, one coverage rule — and differ only in who waits.
+
+*Parallel* is the ordinary path and the one a well-configured session never
+leaves. A compaction runs beside the conversation: arcs opened during the
+window project the full history, which is large but works, and the arc after
+the window gets the summary. Nothing is held, no admission check is made,
+and the cost of the mode is one oversized turn per compaction.
+
+*Blocking* holds the admission of new arcs while the request is outstanding.
+It is the mode the hard budget argues for — see Two thresholds — where an arc
+projecting the full history would be rejected by the provider rather than
+merely cost more. Blocking is not a second mechanism: it is the same request
+record, read by whoever admits an arc instead of ignored.
+
+The mode is a property of the session's configuration rather than a fact the
+log carries, which is safe because it changes nothing about correctness — a
+session that switched modes mid-flight would change only whether the next arc
+waits, never what any arc reads.
+
+Session interleaving and one lease
+--------------------
+A session also configures whether its arcs interleave. One arc at a time
+is a real requirement — a session driven by a single user, or one whose
+turns must be serial for the product's own reasons — and it needs
+session-level mutual exclusion that the framework does not otherwise have:
+the `ArcLease` is per arc, and nothing stops two arcs of one session being
+worked at once.
+
+The exclusion it needs is a lease over the session, and that is the same
+mechanism with a different key: the lease's holder, TTL, heartbeat and
+holder-checked release are all key-agnostic, and `redisinfra` gains the
+session-scoped key shape rather than a second lease. One mechanism, two
+jobs — and the second job is blocking compaction. A session held to one arc
+at a time already excludes everything else from working its arcs, so a
+blocking compaction there takes the same session lease and the exclusion
+comes for free. In a session whose arcs interleave, the lease is not taken
+and the request record does the holding alone.
+
+The exclusion matrix
+--------------------
+The natural shape for all of this looks like a session-level read/write
+lock: compaction the writer, arc work the readers, arcs shared among
+themselves. Laid out as a matrix of who must wait for whom, it comes out
+asymmetric, and the asymmetry is why it is not a lock pair.
+
+                      compaction    a new arc    an arc under way
+    compaction        exclude        exclude       must not wait
+    another arc       never          never         never
+
+An arc under way never blocks a compaction, for the two reasons the rest of
+this document builds: the cutoff means the compaction does not reach it, and
+the closed-arc watermark means the compaction does not cover anything it is
+entitled to read uncompacted. A compaction therefore never waits for a
+reader, which is the half of a read/write lock that exists to make writers
+wait — and it is the half nobody here needs.
+
+What remains is one-directional: a compaction holds the admission of new
+arcs, and nothing holds a compaction. That is a gate, not a lock, and the
+gate's state is the request record — derived from the log and the clock,
+decaying on its own — rather than held in a lock that a crashed worker would
+leave closed for ever. In a session held to one arc at a time the gate is
+the session lease, which the previous section gives that mode anyway.
+
+The read/write vocabulary survives only as a description: "read" in the
+sense of *not compaction*, not in the sense of needing exclusion. Readers
+take nothing, share everything, and the writer takes the gate.
+
+The admission race
+--------------------
+A gate read from the log has a race: an arc can pass the check in the
+instant between reading no outstanding request and the compactor writing
+one. That arc projects the full history — wasteful in parallel mode, a
+failed turn at the hard budget — and the coverage rule is what keeps it a
+cost rather than a fault. The next arc gets the summary; nothing is
+incorrect.
+
+Closing the race is possible and cheap if it ever needs closing: a Redis
+gate key, set with a TTL before the compactor computes and checked by
+whoever admits an arc. It is the lease machinery again, and it narrows the
+race without promising to close it — the check and the user's write are not
+one transaction and cannot be made one. Build the record first; add the
+gate key if the measurement says the race is being lost often enough to
+matter.
 
 Where a blocked arc waits
 --------------------
@@ -717,10 +819,18 @@ in.
 
 `pkg/agent` gains the `Compactor` interface, the derivation at arc close, and
 the admission check that holds a message while a compaction is outstanding.
-No lease: the started record does that job. `TaskReports` is unchanged, since
-a report is never held.
+In a session whose arcs interleave the started record does that job alone; in
+a session held to one arc at a time the session lease does it, and that lease
+exists for the interleaving mode regardless. `TaskReports` is unchanged,
+since a report is never held.
 `GuardCancellation` needs no change: `startsWork` covers dispatches and task
 invocations, and a compaction is neither.
+
+`redisinfra` gains the session-scoped key shape for the lease, so the same
+`ArcLease` mechanism serves a session as well as an arc, and, if the admission
+race is ever to be narrowed, the compaction gate key. The session's
+configuration gains the two settings the modes are made of: whether arcs
+interleave, and whether compaction blocks.
 
 The store gains the two queries — the compaction in force, and the events
 above a watermark. `internal/filestore` can implement them by scanning, like

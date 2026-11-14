@@ -58,6 +58,17 @@ so it needs no connection to whoever cancelled. It is also the only mechanism
 here that cannot be lost: a run whose every notification went missing still
 stops before it starts anything else.
 
+`CancelSource` is deliberately not a store interface, even though every store
+so far happens to implement it. It is a one-method seam of its own, next to
+`EventPersistor` and `EventSource`, and the guard takes it separately from
+whatever it writes through. The question it answers — has this arc a cancel
+recorded against it — is a query over the log, so the log's owner can answer
+it, but nothing requires that it does: a deployment may answer from an index
+or a set of cancelled arcs, and the guard would not know. Keeping the seam
+narrow is also what keeps the guard off `GetEventsForArc`, whose contract is
+the projection's cutoff and whose cost is a full projection; the guard wants
+one event and should not have to pay for a transcript to get it.
+
 What it cannot do is bounded by its own granularity. Between two dispatches
 the worker may be streaming a reply or sitting inside a tool, and neither has
 a bound. A four minute rollout runs for four more minutes.
