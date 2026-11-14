@@ -1,6 +1,13 @@
 kube-agent
 ==========
 
+This repository holds three modules, so the framework and its concrete
+implementations cannot grow into each other:
+
+    fillbrunn.ai/kube-agent             the framework (this module)
+    fillbrunn.ai/kube-agent/devchat     the terminal harness
+    fillbrunn.ai/kube-agent/redisinfra  Redis-backed lease, cancellation hub and work queue
+
 An event-sourced agent. The log is the source of truth: a conversation is a
 sequence of events, a `History` is the fold of them, and what the model sees is
 derived from that fold rather than kept alongside it.
