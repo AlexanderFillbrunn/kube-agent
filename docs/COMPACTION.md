@@ -728,6 +728,14 @@ because they are monotone: the cut below the oldest open arc only advances,
 so a later request's watermark is never below an earlier one's, and a
 "covered by an earlier request" test would skip nothing but exact equals.
 
+Stated once, positively: compute the earliest unfulfilled request. Every
+worker reaching for the log reaches the same verdict about whose turn it is,
+which is what makes this single-flight without a lock — the sequence numbers
+totally order the requests, so among several outstanding exactly one is the
+earliest, and the log, not any worker's memory, is the arbiter. The due
+re-derivation still applies at the moment of the call: the earliest request
+whose reason has evaporated drops without one.
+
 The trap is in satisfaction. A request satisfied only when a compaction in
 force covers *its* watermark — the rule the normal case suggests — leaves a
 skipped request outstanding for ever: the compaction it waited for lands
