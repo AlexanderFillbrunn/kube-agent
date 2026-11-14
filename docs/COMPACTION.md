@@ -10,9 +10,9 @@ those two, and the code follows neither this document nor
 [ASYNC-TASKS.md](ASYNC-TASKS.md).
 
 It works through one plan: a request event, a worker that picks it up, a
-result event carrying the summary, playback from the last result, and a lock
-over the session while it happens. The plan survives, with its two halves
-split apart.
+result event carrying the summary, playback from the last result, and the
+session held while it happens — by a record rather than a lock. The plan
+survives, with its two halves split apart.
 
 Nothing needs locking for the log to stay correct, because compaction only
 ever appends. But a compaction takes tens of seconds, and an arc opened
@@ -83,8 +83,9 @@ prevents it without anyone arranging for it to.
 
 The record
 --------------------
-One event type, `COMPACTED`, with no correlation ID and a payload along these
-lines.
+The result is one event type, `COMPACTED`, with no correlation ID and a payload
+along these lines. The request, `COMPACTION_STARTED`, is the other half of the
+pair and is laid out in Admission control below.
 
     type CompactedPayload struct {
         // ThroughSeq is the last event this summary accounts for.
@@ -111,6 +112,13 @@ lines.
 `ThroughSeq` is the whole contract. It is a watermark over the log, and
 every question below — which compaction wins, what a reader loads, whether
 two workers conflict — is answered by comparing watermarks.
+
+The record's `CausationID` names the `COMPACTION_STARTED` it answers. That is
+the request half of the pair: whoever finds compaction due writes the request
+and yields, a worker picks it up, and the result points back. `Supersedes`
+stays as well — one names the request this result answers, the other the
+result this one was built on top of — and the pair is checkable by a reader
+who does not trust the writer.
 
 Compaction is recursive: the second summary is made from the first summary
 plus what has happened since. `Supersedes` records the chain so a reader can
@@ -213,6 +221,90 @@ A near neighbour of this is the reason the session has to be held while a
 compaction runs, since an arc opened during the window is in the same
 position as one already under way. See The window.
 
+The narrow version that does reach under a running arc is the next section.
+It covers the case that happens in practice — an arc that starts near the
+threshold and grows past it through its own rounds — and leaves the long arc
+where this section leaves it.
+
+Compacting under an open arc
+--------------------
+An arc opened just under the soft budget can cross the hard one through its
+own tool rounds. Letting it finish means a turn the provider refuses, so the
+session has one move left: compact the material *before* the arc while the arc
+is held, and resume it on the summary plus its own rounds.
+
+The cut goes immediately below the arc's opening, and that is the ordinary
+watermark rule, not a new one. While the arc is held it is the oldest arc that
+is not closed, so the closed-arc rule already puts the watermark exactly
+there. Nothing of the arc's own material is summarised: its opening event
+survives above the cut, its tool rounds keep their pairs contiguous, and the
+model keeps the request it is working on verbatim. What the summary replaces
+is the conversation history the arc was working on top of, which is the
+material compaction is for. No arc is carried across its own compaction,
+because no arc is compacted.
+
+The hold is the guard's shape. A run refuses writes that start work while a
+compaction request the hard budget crossed is outstanding — the same
+`startsWork` seam `GuardCancellation` refuses on — so the arc stops at a round
+boundary, the boundary being the one place the cut is safe. A soft-budget
+request holds nothing here: pausing a run for it would spend the pause on an
+arc that can still finish, which is parallel mode's whole wager. The refusal
+is a sentinel of the run's own, a sibling of `ErrCancelled`, and is not
+recorded as a failure: the arc has not failed, it is waiting.
+
+What the worker does with the sentinel is the pickup. The worker — not the
+run — refetches the log and applies the rule from Parallel arcs and one
+compaction: is mine the earliest unfulfilled request? Earliest, and the
+worker computes the summary and writes the `COMPACTED` through the ordinary
+persistor chain, `MintIdentity` and `PublishEvents`, which are already
+session-agnostic. Not earliest, and the worker requeues the arc for whoever
+is computing, with a backoff — a busy session would otherwise cycle the arc
+every few milliseconds until the compaction lands, and the request's expiry
+bounds how long the cycling can last.
+
+That the paused worker may end up the one compacting is not a convenience but
+the resolution of a livelock: the party paused by the request is exactly the
+party motivated to fulfill it. It composes with the general case, where a
+request derived at arc close finds nobody paused, and a session-ID work item
+through the same queue reaches the same pick-up rule. Two doors, one rule,
+no double computation. A session held to one arc at a time needs no queueing
+behind itself either: the paused worker already holds the session lease, so
+the earliest case compacts under the lease it holds, and the requeue case
+releases it, which is what lets whoever is computing take it.
+
+The resumed run's view is the summary, then the arc's own rounds whole. And
+the resumption is a new run, not a continuation: the per-run pin below is what
+makes that mandatory rather than tidy. Keeping the process warm — no queue
+round-trip, the model client still connected — is a latency optimization and
+worth having; keeping the run is not available, because the old run's history
+was built before the `COMPACTED` event existed and cannot be updated into the
+new view. The run boundary is the correctness boundary.
+
+One rule genuinely changes: which compaction an arc reads. The `COMPACTED`
+event lands after the arc's opening and carries no correlation ID, so the
+cutoff excludes it from the arc's own query — the mechanism that protects an
+in-flight arc also defeats the resume. The compaction in force is therefore
+pinned at each *run's* start rather than the arc's opening: the resumed run
+reads the compaction in force as of its re-entry point and finishes on that
+view. The invariant weakens from one view per arc to one view per run, with
+the arc spanning two — the same shape RE-ENTRY already uses, where a re-worked
+arc is a new view of the same record. For an arc never held mid-flight the
+two rules are indistinguishable, since nothing lands between its opening and
+its runs.
+
+The costs are the ordinary compaction's, paid mid-conversation: the front of
+the transcript is rewritten, so the resumed run pays full price for the whole
+prompt, and the summary may drop detail from before the arc that the model
+had been leaning on. That is why the move belongs at the hard budget, beside
+blocking compaction — a rescue where the alternative is a failed turn, not a
+path a session with headroom should ever take.
+
+What this still does not reach is the arc whose *own* rounds outgrow the
+window, since its own material is never compacted. That is not a compaction
+problem: it is a loop that should be a task, reported through ASYNC-TASKS so
+the arc closes and the watermark advances, or a second mechanism that
+rewrites a live transcript, which this document declines.
+
 Reading a compacted log
 --------------------
 Read from the watermark, never from the record. This is the one sentence in
@@ -244,7 +336,9 @@ So the store gains two queries.
 restricted to those written at or before the point being read from. For a
 session read whole that is the whole log; for an arc it is the arc's opening,
 which is what pins a compaction to an arc for the arc's lifetime. See Two
-views of one prefix.
+views of one prefix — and Compacting under an open arc for the one exception:
+an arc held mid-flight pins at each run's start instead, since its own opening
+is below the compaction the resumed run must read.
 
 *The events above that watermark,* with the existing cutoff still applied on
 top for an arc read:
@@ -423,9 +517,9 @@ sort of thing you want when a model's later answer has to be explained.
 The rule generalises the failure cases too. A compaction whose watermark is
 below the one in force is already-answered work, discarded on read with no
 special case. A worker that crashed after computing but before writing left
-nothing behind at all. And a worker whose claim on the job expired while it
-was still working writes a perfectly good compaction that is still accepted,
-which is why the expiry below needs no fencing.
+nothing behind at all. And a worker whose request expired while it was still
+working writes a perfectly good compaction that is still accepted, which is
+why the expiry below needs no fencing.
 
 The window
 --------------------
@@ -485,9 +579,21 @@ for free and a side channel is a state it would have to be told about twice.
         // disregarded, as a duration from the event's own timestamp.
         Expiry time.Duration
 
+        // Budget records which threshold was crossed to request this
+        // compaction. A soft request holds nothing; a hard one holds a
+        // running arc as well as the session's new arcs.
+        Budget string
+
         // Actor is who asked, where a person did.
         Actor *users.Actor
     }
+
+The watermark in the request is the closed-arc cut from Where the cut goes,
+capped at the request's own sequence number: the cut can name nothing the
+request has not seen. The cap matters only in a session whose arcs interleave,
+where the request and the last closed arc can be far apart, and it is what
+makes the request the compaction's vantage — the cut is a function of the log
+up to and including the request, and of nothing written after it.
 
 What keeps this from being the work item the previous section argues against
 is that it is written as a fact and never as a claim. It says a compaction
@@ -495,10 +601,17 @@ covering this much was begun at this time and was expected to take this long.
 It says nothing about who holds it, and there is nothing to hand back.
 
 Everything about its status is then derived, in the same style as the rest.
-It is outstanding while no compaction in force covers its watermark and its
-expiry has not passed. It is satisfied the moment a `COMPACTED` clears the
-watermark, with no acknowledgement event. It is abandoned once the expiry
-passes, with no retraction event and nothing to reap.
+It is outstanding while no `COMPACTED` has landed after it and its expiry has
+not passed. It is satisfied the moment one does, with no acknowledgement
+event. It is abandoned once the expiry passes, with no retraction event and
+nothing to reap.
+
+Satisfaction is by recency, and the compaction in force is by coverage — two
+rules for two different questions. A request is a plea — compact this
+session — and any `COMPACTED` written after it answers it, whatever the
+watermark; which compaction the model reads is the other question, and stays
+the greatest `ThroughSeq`. The reason recency is needed and not merely tidy
+is the skipped request: see Parallel arcs and one compaction.
 
 *The expiry is the whole trick, and it is what the crash case turns on.*
 Without it a record that blocks the session is strictly worse than no record:
@@ -516,6 +629,171 @@ exclusion an `ArcLease` would give and one fewer thing to stand up. Two
 workers that start in the same instant write two records and compute two
 summaries; that is waste, bounded by the coverage rule, and not a fault.
 
+Blocking and parallel compaction
+--------------------
+Whether a session holds its arcs while a compaction runs is a mode, chosen by
+the session's configuration. Both modes share the whole design above — one
+record, one result, one coverage rule — and differ only in who waits.
+
+*Parallel* is the ordinary path and the one a well-configured session never
+leaves. A compaction runs beside the conversation: arcs opened during the
+window project the full history, which is large but works, and the arc after
+the window gets the summary. Nothing is held, no admission check is made,
+and the cost of the mode is one oversized turn per compaction.
+
+*Blocking* holds the admission of new arcs while the request is outstanding.
+It is the mode the hard budget argues for — see Two thresholds — where an arc
+projecting the full history would be rejected by the provider rather than
+merely cost more. Blocking is not a second mechanism: it is the same request
+record, read by whoever admits an arc instead of ignored.
+
+The mode is a property of the session's configuration rather than a fact the
+log carries, which is safe because it changes nothing about correctness — a
+session that switched modes mid-flight would change only whether the next arc
+waits, never what any arc reads.
+
+Session interleaving and one lease
+--------------------
+A session also configures whether its arcs interleave. One arc at a time
+is a real requirement — a session driven by a single user, or one whose
+turns must be serial for the product's own reasons — and it needs
+session-level mutual exclusion that the framework does not otherwise have:
+the `ArcLease` is per arc, and nothing stops two arcs of one session being
+worked at once.
+
+The exclusion it needs is a lease over the session, and that is the same
+mechanism with a different key: the lease's holder, TTL, heartbeat and
+holder-checked release are all key-agnostic, and `redisinfra` gains the
+session-scoped key shape rather than a second lease. One mechanism, two
+jobs — and the second job is blocking compaction. A session held to one arc
+at a time already excludes everything else from working its arcs, so a
+blocking compaction there takes the same session lease and the exclusion
+comes for free. In a session whose arcs interleave, the lease is not taken
+and the request record does the holding alone.
+
+The exclusion matrix
+--------------------
+The natural shape for all of this looks like a session-level read/write
+lock: compaction the writer, arc work the readers, arcs shared among
+themselves. Laid out as a matrix of who must wait for whom, it comes out
+asymmetric, and the asymmetry is why it is not a lock pair.
+
+                      compaction    a new arc    an arc under way
+    compaction        exclude        exclude       must not wait
+    another arc       never          never         never
+
+A session held to one arc at a time serializes arcs against each other as
+well, by the lease — that mode's own doing, and not compaction's, which is
+why it is not a row here.
+
+An arc under way never blocks a compaction, for the two reasons the rest of
+this document builds: the cutoff means the compaction does not reach it, and
+the closed-arc watermark means the compaction does not cover anything it is
+entitled to read uncompacted. A compaction therefore never waits for a
+reader, which is the half of a read/write lock that exists to make writers
+wait — and it is the half nobody here needs.
+
+What remains is one-directional: a compaction holds the admission of new
+arcs, and nothing holds a compaction. That is a gate, not a lock, and the
+gate's state is the request record — derived from the log and the clock,
+decaying on its own — rather than held in a lock that a crashed worker would
+leave closed for ever. In a session held to one arc at a time the gate is
+the session lease, which the previous section gives that mode anyway.
+
+The read/write vocabulary survives only as a description: "read" in the
+sense of *not compaction*, not in the sense of needing exclusion. Readers
+take nothing, share everything, and the writer takes the gate.
+
+The admission race
+--------------------
+A gate read from the log has a race: an arc can pass the check in the
+instant between reading no outstanding request and the compactor writing
+one. That arc projects the full history — wasteful in parallel mode, a
+failed turn at the hard budget — and the coverage rule is what keeps it a
+cost rather than a fault. The next arc gets the summary; nothing is
+incorrect.
+
+Closing the race is possible and cheap if it ever needs closing: a Redis
+gate key, set with a TTL before the compactor computes and checked by
+whoever admits an arc. It is the lease machinery again, and it narrows the
+race without promising to close it — the check and the user's write are not
+one transaction and cannot be made one. Build the record first; add the
+gate key if the measurement says the race is being lost often enough to
+matter.
+
+Parallel arcs and one compaction
+--------------------
+Two arcs closing near each other can both find compaction due, and a model
+call is the expensive thing in the system, so the duplicate is worth closing
+rather than merely surviving. The layers are cheap and each one narrows the
+race further.
+
+*The request is session-scoped.* `COMPACTION_STARTED` carries no correlation
+ID, so it belongs to the session rather than to the arc that noticed. Two
+arcs deriving due from the same log produce one job and one duplicate, not
+two jobs; nothing here needs an arc-scoped request.
+
+*The log orders the requests.* A worker that writes a request re-reads, and
+the requests have sequence numbers: the earlier outstanding, unexpired
+request stands and the later worker stands down before paying for anything.
+One extra read per request, and the simultaneous-start race shrinks to the
+instant between the re-read and the call.
+
+*Due is re-derived at the compute, not at the request.* This is the layer that
+protects the money. A worker about to call the model re-checks the log: is
+there an earlier outstanding request, and does the watermark in force already
+clear the budget? A duplicate that queued while the first compaction computed
+drops here, at the cost of a read rather than a call. Derivation at enqueue
+dedupe nothing, because both requests were honest when made; derivation at
+compute dupe, because by then the log has moved.
+
+*The expiry bounds the window and coverage bounds the loss.* A duplicate that
+slips through anyway computes a summary the coverage rule makes inert, so the
+loss is one compaction, never a wrong one. The Redis gate key from the
+admission race is the last notch if measurement ever demands it — single-flight
+at a key, TTL for the crashed worker, advisory so its failure degrades to the
+re-derivation above.
+
+A skipped request needs no marker
+--------------------
+The skip writes nothing, and the skipped request needs no acknowledgement,
+for the same reason the design has no satisfaction event anywhere: status is
+derived. But the derivation has to be the right one, and the obvious choice
+has a trap in it.
+
+The skip rule, exactly: a worker about to compute a request skips it when an
+earlier request for the session is outstanding and unexpired. The comparison
+is by sequence number alone — no watermarks. Watermarks cannot decide it,
+because they are monotone: the cut below the oldest open arc only advances,
+so a later request's watermark is never below an earlier one's, and a
+"covered by an earlier request" test would skip nothing but exact equals.
+
+Stated once, positively: compute the earliest unfulfilled request. Every
+worker reaching for the log reaches the same verdict about whose turn it is,
+which is what makes this single-flight without a lock — the sequence numbers
+totally order the requests, so among several outstanding exactly one is the
+earliest, and the log, not any worker's memory, is the arbiter. The due
+re-derivation still applies at the moment of the call: the earliest request
+whose reason has evaporated drops without one.
+
+The trap is in satisfaction. A request satisfied only when a compaction in
+force covers *its* watermark — the rule the normal case suggests — leaves a
+skipped request outstanding for ever: the compaction it waited for lands
+with a watermark at or below its own, never above, so nothing ever clears
+it, and in a blocking session it holds admission until its own expiry
+passes. A zombie — a request nobody will compute, blocking for no reason.
+
+That is why the previous section's derivation is by recency: the skipped
+request is satisfied the instant the compaction it waited for lands, and
+admission opens. If the answer was thin — the skipped request's watermark
+above the landed one, the region between the cuts left uncompacted — it is
+not silently absorbed: due is re-derived at the next arc close, and a fresh
+request with a fresh watermark and expiry takes over if the budget is still
+crossed. The recursive case is the same machinery, one generation on.
+
+The expiry stays the backstop for the request whose worker died: abandoned
+rather than reaped, and the next derivation starts again.
+
 Where a blocked arc waits
 --------------------
 A blocked session holds the user's message outside the log rather than
@@ -523,12 +801,15 @@ writing it and deferring the work.
 
 Writing it first is the tempting shape, and `TaskReports.Work` is the
 precedent for it: take the work, find it held, return false, let the caller
-come back. It does not survive contact with the cutoff. An arc written at
-sequence 101 and worked at 141 still has its cutoff at 101, so it still does
-not see the `COMPACTED` event at 141 and still projects the oversized
-history. Deferring the work changes nothing about what the arc reads.
-Recovering it would need the compaction exempted from the cutoff, which is
-the retroactivity Two views of one prefix argues against.
+come back. The cutoff used to be the objection — an arc written at 101 and
+worked at 141 could not see the `COMPACTED` at 141 — and the per-run pin from
+Compacting under an open arc dissolves that: the deferred run reads the
+compaction in force at its start. What survives is the watermark. An arc
+written during the window is open, and the cut sits below the oldest open
+arc, so every blocked arc written into the log pins every later compaction
+at its opening. Under the arrival rate that made blocking necessary the
+blocked arcs pile up and the frontier freezes: each compaction covers
+nothing the last one did not, and the session never recovers.
 
 Held outside the log, the message is written once the compaction lands, its
 opening sequence number falls above the `COMPACTED` event, and the cutoff
@@ -647,11 +928,11 @@ Admission control holds new arcs. It must not hold task reports, and the
 reason is that holding them would achieve nothing.
 
 A task report works an arc that already exists, and an arc with an unsettled
-task is an arc that is open, so the watermark is below it by construction. The
-compaction being computed cannot cover any of that arc's material, and the
-arc's query takes the compaction in force as of its own opening, so the new
-one would not reach it even after it lands. Waiting buys the arc nothing and
-costs the task its turn.
+task is an arc that is open, so the watermark is below it by construction:
+the compaction being computed covers none of the arc's own material. The run
+that works the report reads whichever compaction is in force at its start,
+and waiting for a different one buys the arc nothing — its own material is
+untouched either way — while costing the task its turn.
 
 `TaskReports.Report` already has the right shape for this and needs no change:
 it persists the report, then works the arc, and returns whether it worked it.
@@ -717,10 +998,27 @@ in.
 
 `pkg/agent` gains the `Compactor` interface, the derivation at arc close, and
 the admission check that holds a message while a compaction is outstanding.
-No lease: the started record does that job. `TaskReports` is unchanged, since
-a report is never held.
+In a session whose arcs interleave the started record does that job alone; in
+a session held to one arc at a time the session lease does it, and that lease
+exists for the interleaving mode regardless. `TaskReports` is unchanged,
+since a report is never held.
 `GuardCancellation` needs no change: `startsWork` covers dispatches and task
-invocations, and a compaction is neither.
+invocations, and a compaction is neither. Compacting under an open arc reuses
+the same seam from the other side — a run held mid-flight refuses its next
+dispatch while a request is outstanding — and the re-derivation at the
+compute is the derivation at arc close applied a second time, against a log
+that has moved. The refusal is a sentinel error rather than a recorded
+failure, and the pickup on it belongs to the worker, not the run: the run's
+only view of the log is the cutoff-bounded `GetEventsForArc`, which is the
+seam that keeps a run a pure function of its arc's history, and compaction
+stays outside it. The run ends at the sentinel; the worker refetches, applies
+the pick-up rule, computes or requeues, and re-enters the arc as a new run.
+
+`redisinfra` gains the session-scoped key shape for the lease, so the same
+`ArcLease` mechanism serves a session as well as an arc, and, if the admission
+race is ever to be narrowed, the compaction gate key. The session's
+configuration gains the two settings the modes are made of: whether arcs
+interleave, and whether compaction blocks.
 
 The store gains the two queries — the compaction in force, and the events
 above a watermark. `internal/filestore` can implement them by scanning, like
