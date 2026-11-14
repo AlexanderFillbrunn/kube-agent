@@ -565,10 +565,17 @@ covering this much was begun at this time and was expected to take this long.
 It says nothing about who holds it, and there is nothing to hand back.
 
 Everything about its status is then derived, in the same style as the rest.
-It is outstanding while no compaction in force covers its watermark and its
-expiry has not passed. It is satisfied the moment a `COMPACTED` clears the
-watermark, with no acknowledgement event. It is abandoned once the expiry
-passes, with no retraction event and nothing to reap.
+It is outstanding while no `COMPACTED` has landed after it and its expiry has
+not passed. It is satisfied the moment one does, with no acknowledgement
+event. It is abandoned once the expiry passes, with no retraction event and
+nothing to reap.
+
+Satisfaction is by recency, and the compaction in force is by coverage — two
+rules for two different questions. A request is a plea — compact this
+session — and any `COMPACTED` written after it answers it, whatever the
+watermark; which compaction the model reads is the other question, and stays
+the greatest `ThroughSeq`. The reason recency is needed and not merely tidy
+is the skipped request: see Parallel arcs and one compaction.
 
 *The expiry is the whole trick, and it is what the crash case turns on.*
 Without it a record that blocks the session is strictly worse than no record:
@@ -698,10 +705,7 @@ there an earlier outstanding request, and does the watermark in force already
 clear the budget? A duplicate that queued while the first compaction computed
 drops here, at the cost of a read rather than a call. Derivation at enqueue
 dedupe nothing, because both requests were honest when made; derivation at
-compute dupe, because by then the log has moved. The stand-down rule is exact:
-a request whose watermark is covered by an earlier outstanding one is
-already-answered work, while a request with a *higher* watermark may still be
-worth computing after the first lands, which is the recursive case.
+compute dupe, because by then the log has moved.
 
 *The expiry bounds the window and coverage bounds the loss.* A duplicate that
 slips through anyway computes a summary the coverage rule makes inert, so the
@@ -709,6 +713,38 @@ loss is one compaction, never a wrong one. The Redis gate key from the
 admission race is the last notch if measurement ever demands it — single-flight
 at a key, TTL for the crashed worker, advisory so its failure degrades to the
 re-derivation above.
+
+A skipped request needs no marker
+--------------------
+The skip writes nothing, and the skipped request needs no acknowledgement,
+for the same reason the design has no satisfaction event anywhere: status is
+derived. But the derivation has to be the right one, and the obvious choice
+has a trap in it.
+
+The skip rule, exactly: a worker about to compute a request skips it when an
+earlier request for the session is outstanding and unexpired. The comparison
+is by sequence number alone — no watermarks. Watermarks cannot decide it,
+because they are monotone: the cut below the oldest open arc only advances,
+so a later request's watermark is never below an earlier one's, and a
+"covered by an earlier request" test would skip nothing but exact equals.
+
+The trap is in satisfaction. A request satisfied only when a compaction in
+force covers *its* watermark — the rule the normal case suggests — leaves a
+skipped request outstanding for ever: the compaction it waited for lands
+with a watermark at or below its own, never above, so nothing ever clears
+it, and in a blocking session it holds admission until its own expiry
+passes. A zombie — a request nobody will compute, blocking for no reason.
+
+That is why the previous section's derivation is by recency: the skipped
+request is satisfied the instant the compaction it waited for lands, and
+admission opens. If the answer was thin — the skipped request's watermark
+above the landed one, the region between the cuts left uncompacted — it is
+not silently absorbed: due is re-derived at the next arc close, and a fresh
+request with a fresh watermark and expiry takes over if the budget is still
+crossed. The recursive case is the same machinery, one generation on.
+
+The expiry stays the backstop for the request whose worker died: abandoned
+rather than reaped, and the next derivation starts again.
 
 Where a blocked arc waits
 --------------------
