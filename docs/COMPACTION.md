@@ -723,7 +723,7 @@ a report is never held.
 invocations, and a compaction is neither.
 
 The store gains the two queries — the compaction in force, and the events
-above a watermark. `internal/filestore` can implement them by scanning, like
+above a watermark. `devchat/filestore` can implement them by scanning, like
 it does everything else, and the package comment's "never compacts" describes
 the file on disk and stays true.
 

@@ -1,9 +1,10 @@
 // Package filestore keeps an event log in a single file, so the agent can be
 // exercised end to end without standing anything up.
 //
-// It is a development and test store, under internal/ so that it cannot become
-// anything else. It holds the whole log in memory on every read, scans the file
-// for every query, never compacts, and assumes it is the only writer.
+// It is a development and test store, living in the devchat module so that
+// the framework cannot reach it. It holds the whole log in memory on every
+// read, scans the file for every query, never compacts, and assumes it is the
+// only writer.
 //
 // What it does hold to is the contract the projection depends on. See
 // GetEventsForArc.

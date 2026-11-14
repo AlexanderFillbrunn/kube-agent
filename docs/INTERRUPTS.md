@@ -10,7 +10,7 @@ Interrupts are a special case among the proposals. Half of one is already
 built and specified: the two event types, the fold, the phase, the arc status,
 and the projection notes all exist and are tested. What is missing is the
 other half. Nothing in `pkg/agent` ever raises an interrupt, and nothing in
-`cmd/devchat` can answer one.
+`devchat` can answer one.
 
 This document covers that half: how the agent asks, and how a human answers.
 What happens to the arc once the answer is in the log is the same question a
@@ -144,7 +144,7 @@ scheduled, and nothing on the screen to say so.
 
 What the interface still owes
 --------------------
-`cmd/devchat` is the harness and is not the product, but it is where this is
+`devchat` is the harness and is not the product, but it is where this is
 exercised first.
 
     fromHistory and stateOf ignore interrupts, so a session reopened on a log

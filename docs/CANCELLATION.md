@@ -82,7 +82,7 @@ and money, never correctness.
 
 Producer and consumer are separate, as with the queue. The canceller
 announces, the worker watches, and nothing holds both. `LocalCancels` is both
-for one process, which is what `cmd/devchat` wires.
+for one process, which is what `devchat` wires.
 
     // CancelNotifier tells watchers that an arc has been cancelled. It is
     // best effort: a failure here does not fail the cancel.
@@ -148,7 +148,7 @@ task that could not be reached fails the run, so whoever handed the arc over
 comes back with it. Asking a task to stop twice is harmless, which is what
 makes coming back safe.
 
-A cancel in `cmd/devchat` writes the record, announces it, and leaves the arc
+A cancel in `devchat` writes the record, announces it, and leaves the arc
 owed a run.
 
 Asking a task to stop is not settling it. The cancel ends the waiting, and
@@ -177,7 +177,7 @@ A tool that is stopped has to say what it did. A mutating tool interrupted
 after it issued its change reports that in its result rather than returning an
 error, because an error is recorded as a definite failure and a model told the
 restart failed is a model that restarts it again. `restartDeployment` in
-`cmd/devchat/tools.go` is the worked example.
+`devchat/tools.go` is the worked example.
 
 What a cancelled context reaches
 --------------------
