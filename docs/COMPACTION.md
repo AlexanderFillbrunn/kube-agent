@@ -83,8 +83,9 @@ prevents it without anyone arranging for it to.
 
 The record
 --------------------
-One event type, `COMPACTED`, with no correlation ID and a payload along these
-lines.
+The result is one event type, `COMPACTED`, with no correlation ID and a payload
+along these lines. The request, `COMPACTION_STARTED`, is the other half of the
+pair and is laid out in Admission control below.
 
     type CompactedPayload struct {
         // ThroughSeq is the last event this summary accounts for.
@@ -216,6 +217,10 @@ Relieving that one means rewriting a transcript while a run is reading it,
 paying the cache and the reasoning deliberately, and it is a second mechanism
 rather than a setting on this one.
 
+A near neighbour of this is the reason the session has to be held while a
+compaction runs, since an arc opened during the window is in the same
+position as one already under way. See The window.
+
 The narrow version that does reach under a running arc is the next section.
 It covers the case that happens in practice — an arc that starts near the
 threshold and grows past it through its own rounds — and leaves the long arc
@@ -239,11 +244,13 @@ material compaction is for. No arc is carried across its own compaction,
 because no arc is compacted.
 
 The hold is the guard's shape. A run refuses writes that start work while a
-compaction request is outstanding — the same `startsWork` seam
-`GuardCancellation` refuses on — so the arc stops at a round boundary, the
-boundary being the one place the cut is safe. The refusal is a sentinel of the
-run's own, a sibling of `ErrCancelled`, and is not recorded as a failure: the
-arc has not failed, it is waiting.
+compaction request the hard budget crossed is outstanding — the same
+`startsWork` seam `GuardCancellation` refuses on — so the arc stops at a round
+boundary, the boundary being the one place the cut is safe. A soft-budget
+request holds nothing here: pausing a run for it would spend the pause on an
+arc that can still finish, which is parallel mode's whole wager. The refusal
+is a sentinel of the run's own, a sibling of `ErrCancelled`, and is not
+recorded as a failure: the arc has not failed, it is waiting.
 
 What the worker does with the sentinel is the pickup. The worker — not the
 run — refetches the log and applies the rule from Parallel arcs and one
@@ -260,7 +267,10 @@ the resolution of a livelock: the party paused by the request is exactly the
 party motivated to fulfill it. It composes with the general case, where a
 request derived at arc close finds nobody paused, and a session-ID work item
 through the same queue reaches the same pick-up rule. Two doors, one rule,
-no double computation.
+no double computation. A session held to one arc at a time needs no queueing
+behind itself either: the paused worker already holds the session lease, so
+the earliest case compacts under the lease it holds, and the requeue case
+releases it, which is what lets whoever is computing take it.
 
 The resumed run's view is the summary, then the arc's own rounds whole. And
 the resumption is a new run, not a continuation: the per-run pin below is what
@@ -294,10 +304,6 @@ window, since its own material is never compacted. That is not a compaction
 problem: it is a loop that should be a task, reported through ASYNC-TASKS so
 the arc closes and the watermark advances, or a second mechanism that
 rewrites a live transcript, which this document declines.
-
-A near neighbour of this is the reason the session has to be held while a
-compaction runs, since an arc opened during the window is in the same
-position as one already under way. See The window.
 
 Reading a compacted log
 --------------------
@@ -511,9 +517,9 @@ sort of thing you want when a model's later answer has to be explained.
 The rule generalises the failure cases too. A compaction whose watermark is
 below the one in force is already-answered work, discarded on read with no
 special case. A worker that crashed after computing but before writing left
-nothing behind at all. And a worker whose claim on the job expired while it
-was still working writes a perfectly good compaction that is still accepted,
-which is why the expiry below needs no fencing.
+nothing behind at all. And a worker whose request expired while it was still
+working writes a perfectly good compaction that is still accepted, which is
+why the expiry below needs no fencing.
 
 The window
 --------------------
@@ -572,6 +578,11 @@ for free and a side channel is a state it would have to be told about twice.
         // Expiry is how long this may hold the session before it is
         // disregarded, as a duration from the event's own timestamp.
         Expiry time.Duration
+
+        // Budget records which threshold was crossed to request this
+        // compaction. A soft request holds nothing; a hard one holds a
+        // running arc as well as the session's new arcs.
+        Budget string
 
         // Actor is who asked, where a person did.
         Actor *users.Actor
@@ -670,6 +681,10 @@ asymmetric, and the asymmetry is why it is not a lock pair.
                       compaction    a new arc    an arc under way
     compaction        exclude        exclude       must not wait
     another arc       never          never         never
+
+A session held to one arc at a time serializes arcs against each other as
+well, by the lease — that mode's own doing, and not compaction's, which is
+why it is not a row here.
 
 An arc under way never blocks a compaction, for the two reasons the rest of
 this document builds: the cutoff means the compaction does not reach it, and
@@ -786,12 +801,15 @@ writing it and deferring the work.
 
 Writing it first is the tempting shape, and `TaskReports.Work` is the
 precedent for it: take the work, find it held, return false, let the caller
-come back. It does not survive contact with the cutoff. An arc written at
-sequence 101 and worked at 141 still has its cutoff at 101, so it still does
-not see the `COMPACTED` event at 141 and still projects the oversized
-history. Deferring the work changes nothing about what the arc reads.
-Recovering it would need the compaction exempted from the cutoff, which is
-the retroactivity Two views of one prefix argues against.
+come back. The cutoff used to be the objection — an arc written at 101 and
+worked at 141 could not see the `COMPACTED` at 141 — and the per-run pin from
+Compacting under an open arc dissolves that: the deferred run reads the
+compaction in force at its start. What survives is the watermark. An arc
+written during the window is open, and the cut sits below the oldest open
+arc, so every blocked arc written into the log pins every later compaction
+at its opening. Under the arrival rate that made blocking necessary the
+blocked arcs pile up and the frontier freezes: each compaction covers
+nothing the last one did not, and the session never recovers.
 
 Held outside the log, the message is written once the compaction lands, its
 opening sequence number falls above the `COMPACTED` event, and the cutoff
@@ -910,11 +928,11 @@ Admission control holds new arcs. It must not hold task reports, and the
 reason is that holding them would achieve nothing.
 
 A task report works an arc that already exists, and an arc with an unsettled
-task is an arc that is open, so the watermark is below it by construction. The
-compaction being computed cannot cover any of that arc's material, and the
-arc's query takes the compaction in force as of its own opening, so the new
-one would not reach it even after it lands. Waiting buys the arc nothing and
-costs the task its turn.
+task is an arc that is open, so the watermark is below it by construction:
+the compaction being computed covers none of the arc's own material. The run
+that works the report reads whichever compaction is in force at its start,
+and waiting for a different one buys the arc nothing — its own material is
+untouched either way — while costing the task its turn.
 
 `TaskReports.Report` already has the right shape for this and needs no change:
 it persists the report, then works the arc, and returns whether it worked it.
