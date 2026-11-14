@@ -241,9 +241,34 @@ because no arc is compacted.
 The hold is the guard's shape. A run refuses writes that start work while a
 compaction request is outstanding — the same `startsWork` seam
 `GuardCancellation` refuses on — so the arc stops at a round boundary, the
-boundary being the one place the cut is safe, and the queue re-delivers the
-arc when the compaction lands. The resumed run's view is the summary, then the
-arc's own rounds whole.
+boundary being the one place the cut is safe. The refusal is a sentinel of the
+run's own, a sibling of `ErrCancelled`, and is not recorded as a failure: the
+arc has not failed, it is waiting.
+
+What the worker does with the sentinel is the pickup. The worker — not the
+run — refetches the log and applies the rule from Parallel arcs and one
+compaction: is mine the earliest unfulfilled request? Earliest, and the
+worker computes the summary and writes the `COMPACTED` through the ordinary
+persistor chain, `MintIdentity` and `PublishEvents`, which are already
+session-agnostic. Not earliest, and the worker requeues the arc for whoever
+is computing, with a backoff — a busy session would otherwise cycle the arc
+every few milliseconds until the compaction lands, and the request's expiry
+bounds how long the cycling can last.
+
+That the paused worker may end up the one compacting is not a convenience but
+the resolution of a livelock: the party paused by the request is exactly the
+party motivated to fulfill it. It composes with the general case, where a
+request derived at arc close finds nobody paused, and a session-ID work item
+through the same queue reaches the same pick-up rule. Two doors, one rule,
+no double computation.
+
+The resumed run's view is the summary, then the arc's own rounds whole. And
+the resumption is a new run, not a continuation: the per-run pin below is what
+makes that mandatory rather than tidy. Keeping the process warm — no queue
+round-trip, the model client still connected — is a latency optimization and
+worth having; keeping the run is not available, because the old run's history
+was built before the `COMPACTED` event existed and cannot be updated into the
+new view. The run boundary is the correctness boundary.
 
 One rule genuinely changes: which compaction an arc reads. The `COMPACTED`
 event lands after the arc's opening and carries no correlation ID, so the
@@ -964,7 +989,12 @@ invocations, and a compaction is neither. Compacting under an open arc reuses
 the same seam from the other side — a run held mid-flight refuses its next
 dispatch while a request is outstanding — and the re-derivation at the
 compute is the derivation at arc close applied a second time, against a log
-that has moved.
+that has moved. The refusal is a sentinel error rather than a recorded
+failure, and the pickup on it belongs to the worker, not the run: the run's
+only view of the log is the cutoff-bounded `GetEventsForArc`, which is the
+seam that keeps a run a pure function of its arc's history, and compaction
+stays outside it. The run ends at the sentinel; the worker refetches, applies
+the pick-up rule, computes or requeues, and re-enters the arc as a new run.
 
 `redisinfra` gains the session-scoped key shape for the lease, so the same
 `ArcLease` mechanism serves a session as well as an arc, and, if the admission
