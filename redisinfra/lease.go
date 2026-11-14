@@ -1,7 +1,8 @@
 // Package redisinfra holds the distributed halves the agent framework left
 // local: the lease that keeps two runs off one arc when they are in two
 // processes, the cancellation notice that reaches a run already under way,
-// and the queue that delivers the runs a write owes an arc.
+// the queue that delivers the runs a write owes an arc, and the event log
+// those processes share.
 //
 // Everything here talks to Redis by address from configuration. Nothing
 // listens, nothing is reachable from outside, and nothing knows about an
