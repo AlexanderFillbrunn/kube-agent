@@ -216,6 +216,60 @@ Relieving that one means rewriting a transcript while a run is reading it,
 paying the cache and the reasoning deliberately, and it is a second mechanism
 rather than a setting on this one.
 
+The narrow version that does reach under a running arc is the next section.
+It covers the case that happens in practice — an arc that starts near the
+threshold and grows past it through its own rounds — and leaves the long arc
+where this section leaves it.
+
+Compacting under an open arc
+--------------------
+An arc opened just under the soft budget can cross the hard one through its
+own tool rounds. Letting it finish means a turn the provider refuses, so the
+session has one move left: compact the material *before* the arc while the arc
+is held, and resume it on the summary plus its own rounds.
+
+The cut goes immediately below the arc's opening, and that is the ordinary
+watermark rule, not a new one. While the arc is held it is the oldest arc that
+is not closed, so the closed-arc rule already puts the watermark exactly
+there. Nothing of the arc's own material is summarised: its opening event
+survives above the cut, its tool rounds keep their pairs contiguous, and the
+model keeps the request it is working on verbatim. What the summary replaces
+is the conversation history the arc was working on top of, which is the
+material compaction is for. No arc is carried across its own compaction,
+because no arc is compacted.
+
+The hold is the guard's shape. A run refuses writes that start work while a
+compaction request is outstanding — the same `startsWork` seam
+`GuardCancellation` refuses on — so the arc stops at a round boundary, the
+boundary being the one place the cut is safe, and the queue re-delivers the
+arc when the compaction lands. The resumed run's view is the summary, then the
+arc's own rounds whole.
+
+One rule genuinely changes: which compaction an arc reads. The `COMPACTED`
+event lands after the arc's opening and carries no correlation ID, so the
+cutoff excludes it from the arc's own query — the mechanism that protects an
+in-flight arc also defeats the resume. The compaction in force is therefore
+pinned at each *run's* start rather than the arc's opening: the resumed run
+reads the compaction in force as of its re-entry point and finishes on that
+view. The invariant weakens from one view per arc to one view per run, with
+the arc spanning two — the same shape RE-ENTRY already uses, where a re-worked
+arc is a new view of the same record. For an arc never held mid-flight the
+two rules are indistinguishable, since nothing lands between its opening and
+its runs.
+
+The costs are the ordinary compaction's, paid mid-conversation: the front of
+the transcript is rewritten, so the resumed run pays full price for the whole
+prompt, and the summary may drop detail from before the arc that the model
+had been leaning on. That is why the move belongs at the hard budget, beside
+blocking compaction — a rescue where the alternative is a failed turn, not a
+path a session with headroom should ever take.
+
+What this still does not reach is the arc whose *own* rounds outgrow the
+window, since its own material is never compacted. That is not a compaction
+problem: it is a loop that should be a task, reported through ASYNC-TASKS so
+the arc closes and the watermark advances, or a second mechanism that
+rewrites a live transcript, which this document declines.
+
 A near neighbour of this is the reason the session has to be held while a
 compaction runs, since an arc opened during the window is in the same
 position as one already under way. See The window.
@@ -251,7 +305,9 @@ So the store gains two queries.
 restricted to those written at or before the point being read from. For a
 session read whole that is the whole log; for an arc it is the arc's opening,
 which is what pins a compaction to an arc for the arc's lifetime. See Two
-views of one prefix.
+views of one prefix — and Compacting under an open arc for the one exception:
+an arc held mid-flight pins at each run's start instead, since its own opening
+is below the compaction the resumed run must read.
 
 *The events above that watermark,* with the existing cutoff still applied on
 top for an arc read:
@@ -618,6 +674,42 @@ one transaction and cannot be made one. Build the record first; add the
 gate key if the measurement says the race is being lost often enough to
 matter.
 
+Parallel arcs and one compaction
+--------------------
+Two arcs closing near each other can both find compaction due, and a model
+call is the expensive thing in the system, so the duplicate is worth closing
+rather than merely surviving. The layers are cheap and each one narrows the
+race further.
+
+*The request is session-scoped.* `COMPACTION_STARTED` carries no correlation
+ID, so it belongs to the session rather than to the arc that noticed. Two
+arcs deriving due from the same log produce one job and one duplicate, not
+two jobs; nothing here needs an arc-scoped request.
+
+*The log orders the requests.* A worker that writes a request re-reads, and
+the requests have sequence numbers: the earlier outstanding, unexpired
+request stands and the later worker stands down before paying for anything.
+One extra read per request, and the simultaneous-start race shrinks to the
+instant between the re-read and the call.
+
+*Due is re-derived at the compute, not at the request.* This is the layer that
+protects the money. A worker about to call the model re-checks the log: is
+there an earlier outstanding request, and does the watermark in force already
+clear the budget? A duplicate that queued while the first compaction computed
+drops here, at the cost of a read rather than a call. Derivation at enqueue
+dedupe nothing, because both requests were honest when made; derivation at
+compute dupe, because by then the log has moved. The stand-down rule is exact:
+a request whose watermark is covered by an earlier outstanding one is
+already-answered work, while a request with a *higher* watermark may still be
+worth computing after the first lands, which is the recursive case.
+
+*The expiry bounds the window and coverage bounds the loss.* A duplicate that
+slips through anyway computes a summary the coverage rule makes inert, so the
+loss is one compaction, never a wrong one. The Redis gate key from the
+admission race is the last notch if measurement ever demands it — single-flight
+at a key, TTL for the crashed worker, advisory so its failure degrades to the
+re-derivation above.
+
 Where a blocked arc waits
 --------------------
 A blocked session holds the user's message outside the log rather than
@@ -824,7 +916,11 @@ a session held to one arc at a time the session lease does it, and that lease
 exists for the interleaving mode regardless. `TaskReports` is unchanged,
 since a report is never held.
 `GuardCancellation` needs no change: `startsWork` covers dispatches and task
-invocations, and a compaction is neither.
+invocations, and a compaction is neither. Compacting under an open arc reuses
+the same seam from the other side — a run held mid-flight refuses its next
+dispatch while a request is outstanding — and the re-derivation at the
+compute is the derivation at arc close applied a second time, against a log
+that has moved.
 
 `redisinfra` gains the session-scoped key shape for the lease, so the same
 `ArcLease` mechanism serves a session as well as an arc, and, if the admission
