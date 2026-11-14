@@ -31,11 +31,13 @@ guarded and reaches a run in this process, but nothing further.
 
 Development harness
 --------------------
-`cmd/devchat` and `internal/filestore` exist to exercise the agent by hand.
-Neither is part of the product.
+`devchat` is a separate module in this repository, so the agent framework and
+its UI cannot grow into each other. `devchat` and `devchat/filestore` exist to
+exercise the agent by hand. Neither is part of the product.
 
     export OPENAI_API_KEY=...
-    go run ./cmd/devchat
+    cd devchat
+    go run .
 
 A full-screen terminal interface, built on Bubble Tea. Type a message; the
 agent runs until it is your turn again, with the reply appearing as it is
@@ -70,8 +72,9 @@ something you can read with `cat` and a failure something you can replay:
 `-store` takes any path if you want a session somewhere else; the directory is
 created if it is not there.
 
-`internal/filestore` is under `internal/` on purpose. It reads the whole log
-for every query, never compacts, and assumes a single writer. It is a way to
+`devchat/filestore` lives in the harness's module, out of the framework's
+reach, on purpose. It reads the whole log for every query, never compacts, and
+assumes a single writer. It is a way to
 run the agent without standing anything up, not the first draft of a real
 store. The one thing it does take seriously is the cutoff `GetEventsForArc`
 implements, because the projection's correctness rests on it.

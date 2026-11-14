@@ -4,7 +4,7 @@ Event sink
 Status
 --------------------
 Built. `EventSink`, `PublishEvents`, `TokenSink`, `ArcRef` and `RunOptions` are
-in `pkg/agent`, and `cmd/devchat` is wired through them.
+in `pkg/agent`, and `devchat` is wired through them.
 
 The agent used to notify an interface directly: `AgentConfig.Observer` took
 every event it folded and `AgentConfig.Tokens` took the model's text as it
@@ -121,7 +121,7 @@ field for either.
 `AgentConfig.Observer` was deleted rather than renamed. The agent has no notion
 of notification at all, and `AgentConfig` is left holding the system prompt.
 
-In `cmd/devchat` this removed the two places the screen was written to by hand.
+In `devchat` this removed the two places the screen was written to by hand.
 The user's message is no longer put on the screen when enter is pressed, since
 the write publishes it straight back, and a task no longer tells the interface
 what it reported, since the report is published by the persistor that wrote it.
@@ -180,7 +180,7 @@ same ID to `recordResponse`.
 before writing the `ASSISTANT_MESSAGE` leaves a subscriber holding text for a
 message the log does not have. So: a subscriber replaces streamed text with the
 recorded content when the event arrives, and discards it when the arc ends
-without one. `cmd/devchat`'s transcript does the first part positionally
+without one. `devchat`'s transcript does the first part positionally
 (`transcript.token`, then the `ASSISTANT_MESSAGE` case overwrites it), which is
 a guess about which block was streaming. The message ID is now on the token, so
 that guess can be replaced whenever the harness shows more than one arc.
@@ -249,7 +249,7 @@ reporting in from another process cannot be routed: `TaskReports.Report` calls
 *Nothing invents a session ID.* `StampIdentity` lost its `sessionID` argument
 and became `MintIdentity`, filling in only the ID and timestamp. Every writer
 sets `SessionID` on the event itself: the agent reads it from the history it
-was given, `cmd/devchat`'s session from its own. One rule, no helper, and an
+was given, `devchat`'s session from its own. One rule, no helper, and an
 event that arrives without a session is refused rather than filed somewhere
 plausible.
 
@@ -265,8 +265,8 @@ What this touched
     pkg/agent/cancellation.go   CancelSource takes ArcRef; the cache is gone
     pkg/agent/tasks.go          TaskRef embeds ArcRef
     pkg/agent/reports.go        Report routes by ArcRef
-    internal/filestore          both queries take ArcRef and scope by session
-    cmd/devchat                 one sink per stream, wired into the persistor
+    devchat/filestore          both queries take ArcRef and scope by session
+    devchat                 one sink per stream, wired into the persistor
                                 and the worker rather than into the agent
 
     docs/RE-ENTRY.md            ArcQueue, ArcClaims and Claim carry ArcRef

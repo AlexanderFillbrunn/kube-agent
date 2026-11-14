@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"fillbrunn.ai/kube-agent/internal/filestore"
+	"fillbrunn.ai/kube-agent/devchat/filestore"
 	"fillbrunn.ai/kube-agent/pkg/agent"
 	"fillbrunn.ai/kube-agent/pkg/events"
 	"fillbrunn.ai/kube-agent/pkg/history"

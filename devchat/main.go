@@ -4,7 +4,7 @@
 // file-based log and offers tools that answer from canned data.
 //
 //	export OPENAI_API_KEY=...
-//	go run ./cmd/devchat
+//	cd devchat && go run .
 //
 // Type a message and the agent runs until it is your turn again. Enter sends
 // and esc leaves. A run in progress is stopped by ctrl+c or by /cancel, which
@@ -24,7 +24,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"fillbrunn.ai/kube-agent/internal/filestore"
+	"fillbrunn.ai/kube-agent/devchat/filestore"
 	"fillbrunn.ai/kube-agent/pkg/agent"
 	"fillbrunn.ai/kube-agent/pkg/users"
 )
